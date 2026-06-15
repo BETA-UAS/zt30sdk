@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "siyi-zt30-sdk"
+version = "0.1.0"
+description = "Independent Python UDP SDK and UI for SIYI ZT30 gimbal camera"
+requires-python = ">=3.9"
+authors = [{name = "Internal SDK"}]
+
+[project.optional-dependencies]
+ui = ["Pillow>=10"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["siyi_zt30*"]
