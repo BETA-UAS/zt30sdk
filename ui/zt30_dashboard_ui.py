@@ -4,10 +4,13 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
+import struct
 import subprocess
 import sys
 import threading
+import time
 import tkinter as tk
 from pathlib import Path
 from tkinter import messagebox, scrolledtext, ttk
@@ -28,6 +31,10 @@ from siyi_zt30.constants import IMAGE_MODES, THERMAL_PALETTES
 
 def rtsp_url(host: str, stream: int) -> str:
     return f"rtsp://{host}:8554/video{stream}"
+
+
+def clamp(value: int, min_value: int, max_value: int) -> int:
+    return max(min_value, min(max_value, value))
 
 
 class StreamPanel(ttk.Frame):
@@ -219,6 +226,11 @@ class ZT30Dashboard(tk.Tk):
         self.geometry("1320x840")
         self.minsize(1120, 720)
         self.client: ZT30UDPClient | None = None
+        self.joystick_thread = None
+        self.joystick_stop_event = threading.Event()
+        self.joystick_lock = threading.Lock()
+        self.joystick_axes = {4: 0, 5: 0}
+        self.joystick_last_speed = (None, None)
         self.live_attitude = tk.BooleanVar(value=False)
         self._setup_style()
         self._build_vars()
@@ -262,6 +274,12 @@ class ZT30Dashboard(tk.Tk):
         self.main_url_var = tk.StringVar(value=rtsp_url(DEFAULT_IP, 1))
         self.sub_url_var = tk.StringVar(value=rtsp_url(DEFAULT_IP, 2))
         self.speed_var = tk.IntVar(value=35)
+        self.joystick_enabled_var = tk.BooleanVar(value=False)
+        self.joystick_device_var = tk.StringVar(value="/dev/input/js0")
+        self.joystick_deadzone_var = tk.IntVar(value=5000)
+        self.joystick_status_var = tk.StringVar(value="Disabled")
+        self.joystick_pan_var = tk.StringVar(value="0")
+        self.joystick_tilt_var = tk.StringVar(value="0")
         self.yaw_angle_var = tk.DoubleVar(value=0.0)
         self.pitch_angle_var = tk.DoubleVar(value=0.0)
         self.zoom_var = tk.DoubleVar(value=4.5)
@@ -348,6 +366,8 @@ class ZT30Dashboard(tk.Tk):
         for mode in ("lock", "follow", "fpv"):
             ttk.Button(modes, text=mode.upper(), command=lambda value=mode: self._run(f"mode {value}", lambda: self.client.set_motion_mode(value))).pack(side=tk.LEFT, expand=True, fill=tk.X, padx=3)
 
+        self._build_joystick_panel(parent)
+
         camera = self._panel(parent, "Camera")
         row = ttk.Frame(camera, style="Panel.TFrame")
         row.pack(fill=tk.X)
@@ -390,6 +410,34 @@ class ZT30Dashboard(tk.Tk):
         ttk.Entry(point, textvariable=self.temp_y_var, width=7).pack(side=tk.LEFT, padx=6)
         ttk.Button(point, text="Point Temp", command=lambda: self._run("point temp", lambda: self.client.request_temperature_point(self.temp_x_var.get(), self.temp_y_var.get()))).pack(side=tk.LEFT, fill=tk.X, expand=True)
         ttk.Button(thermal, text="Full Image Temperature", command=lambda: self._run("full temp", self.client.request_temperature_full_image)).pack(fill=tk.X, pady=(8, 0))
+
+    def _build_joystick_panel(self, parent):
+        joystick = self._panel(parent, "Joystick")
+        ttk.Checkbutton(
+            joystick,
+            text="Enable /dev/input joystick",
+            variable=self.joystick_enabled_var,
+            command=self._toggle_joystick,
+        ).pack(anchor=tk.W)
+
+        device = ttk.Frame(joystick, style="Panel.TFrame")
+        device.pack(fill=tk.X, pady=(8, 0))
+        ttk.Label(device, text="Device").pack(side=tk.LEFT)
+        ttk.Entry(device, textvariable=self.joystick_device_var).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(8, 0))
+
+        deadzone = ttk.Frame(joystick, style="Panel.TFrame")
+        deadzone.pack(fill=tk.X, pady=(8, 0))
+        ttk.Label(deadzone, text="Deadzone").pack(side=tk.LEFT)
+        ttk.Scale(deadzone, from_=0, to=16000, variable=self.joystick_deadzone_var, orient=tk.HORIZONTAL).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=8)
+        ttk.Label(deadzone, textvariable=self.joystick_deadzone_var, style="Muted.TLabel", width=6).pack(side=tk.RIGHT)
+
+        readout = ttk.Frame(joystick, style="Panel.TFrame")
+        readout.pack(fill=tk.X, pady=(8, 0))
+        ttk.Label(readout, text="Pan", style="Muted.TLabel").pack(side=tk.LEFT)
+        ttk.Label(readout, textvariable=self.joystick_pan_var, width=5).pack(side=tk.LEFT, padx=(4, 12))
+        ttk.Label(readout, text="Tilt", style="Muted.TLabel").pack(side=tk.LEFT)
+        ttk.Label(readout, textvariable=self.joystick_tilt_var, width=5).pack(side=tk.LEFT, padx=(4, 12))
+        ttk.Label(readout, textvariable=self.joystick_status_var, style="Muted.TLabel").pack(side=tk.RIGHT)
 
     def _build_video_stack(self, parent):
         parent.rowconfigure(0, weight=1)
@@ -470,6 +518,10 @@ class ZT30Dashboard(tk.Tk):
         return btn
 
     def _connect_client(self):
+        restart_joystick = self.joystick_enabled_var.get()
+        if restart_joystick:
+            self._stop_joystick(wait=True)
+
         if self.client is not None:
             try:
                 self.client.close()
@@ -480,6 +532,130 @@ class ZT30Dashboard(tk.Tk):
         self.main_url_var.set(rtsp_url(host, 1))
         self.sub_url_var.set(rtsp_url(host, 2))
         self._log(f"Connected target {host}:{self.port_var.get()}")
+
+        if restart_joystick:
+            self.joystick_enabled_var.set(True)
+            self._start_joystick()
+
+    def _toggle_joystick(self):
+        if self.joystick_enabled_var.get():
+            self._start_joystick()
+        else:
+            self._stop_joystick()
+
+    def _start_joystick(self):
+        if self.joystick_thread and self.joystick_thread.is_alive():
+            return
+        self.joystick_stop_event.clear()
+        self.joystick_last_speed = (None, None)
+        with self.joystick_lock:
+            self.joystick_axes = {4: 0, 5: 0}
+        self.joystick_status_var.set("Starting")
+        self.joystick_thread = threading.Thread(target=self._joystick_loop, daemon=True)
+        self.joystick_thread.start()
+
+    def _stop_joystick(self, wait: bool = False):
+        self.joystick_stop_event.set()
+        self.joystick_status_var.set("Disabled")
+        self.joystick_pan_var.set("0")
+        self.joystick_tilt_var.set("0")
+        self.joystick_last_speed = (None, None)
+        if self.client is not None:
+            try:
+                self.client.stop_rotation()
+            except Exception as exc:
+                self._log(f"joystick stop: ERROR {exc}")
+        if wait and self.joystick_thread and self.joystick_thread.is_alive():
+            self.joystick_thread.join(timeout=0.8)
+
+    def _joystick_loop(self):
+        device = self.joystick_device_var.get().strip() or "/dev/input/js0"
+        event_size = struct.calcsize("IhBB")
+        next_send = 0.0
+        fd = None
+
+        try:
+            fd = os.open(device, os.O_RDONLY | os.O_NONBLOCK)
+            self.after(0, lambda: self.joystick_status_var.set("Active"))
+            self.after(0, lambda: self._log(f"joystick: reading {device}, pan axis 4, tilt axis 5"))
+
+            while not self.joystick_stop_event.is_set():
+                try:
+                    data = os.read(fd, event_size)
+                except BlockingIOError:
+                    data = b""
+                except OSError as exc:
+                    self.after(0, lambda exc=exc: self._log(f"joystick: ERROR {exc}"))
+                    break
+
+                if len(data) == event_size:
+                    _time_ms, value, event_type, number = struct.unpack("IhBB", data)
+                    if event_type & 0x02 and number in (4, 5):
+                        with self.joystick_lock:
+                            self.joystick_axes[number] = value
+
+                now = time.monotonic()
+                if now >= next_send:
+                    yaw, pitch = self._joystick_speeds()
+                    self.after(0, self._update_joystick_readout, yaw, pitch)
+                    self._send_joystick_speed(yaw, pitch)
+                    next_send = now + 0.10
+
+                time.sleep(0.01)
+        except FileNotFoundError:
+            self.after(0, lambda: self.joystick_status_var.set("Missing"))
+            self.after(0, lambda: self._log(f"joystick: device not found {device}"))
+        except PermissionError:
+            self.after(0, lambda: self.joystick_status_var.set("No access"))
+            self.after(0, lambda: self._log(f"joystick: permission denied for {device}"))
+        finally:
+            if fd is not None:
+                os.close(fd)
+            self._send_joystick_speed(0, 0, force=True)
+            self.after(0, self._joystick_finished)
+
+    def _joystick_speeds(self):
+        with self.joystick_lock:
+            pan = self.joystick_axes[4]
+            tilt = self.joystick_axes[5]
+        speed_limit = clamp(int(self.speed_var.get()), 0, 100)
+        deadzone = clamp(int(self.joystick_deadzone_var.get()), 0, 32000)
+        return (
+            self._axis_to_speed(pan, speed_limit, deadzone),
+            self._axis_to_speed(tilt, speed_limit, deadzone),
+        )
+
+    @staticmethod
+    def _axis_to_speed(value: int, speed_limit: int, deadzone: int) -> int:
+        value = clamp(int(value), -32767, 32767)
+        magnitude = abs(value)
+        if magnitude <= deadzone:
+            return 0
+        usable_range = max(1, 32767 - deadzone)
+        scaled = round(((magnitude - deadzone) / usable_range) * speed_limit)
+        return clamp(scaled, 0, speed_limit) * (1 if value > 0 else -1)
+
+    def _send_joystick_speed(self, yaw: int, pitch: int, force: bool = False):
+        if self.client is None:
+            return
+        speed = (yaw, pitch)
+        if not force and speed == self.joystick_last_speed:
+            return
+        self.joystick_last_speed = speed
+        try:
+            self.client.rotate_speed(yaw, pitch)
+        except Exception as exc:
+            self.after(0, lambda exc=exc: self._log(f"joystick rotate: ERROR {exc}"))
+
+    def _update_joystick_readout(self, yaw: int, pitch: int):
+        self.joystick_pan_var.set(str(yaw))
+        self.joystick_tilt_var.set(str(pitch))
+
+    def _joystick_finished(self):
+        if self.joystick_enabled_var.get() and not self.joystick_stop_event.is_set():
+            self.joystick_enabled_var.set(False)
+        if self.joystick_stop_event.is_set():
+            self.joystick_status_var.set("Disabled")
 
     def _run(self, label, func, on_result=None):
         if self.client is None:
@@ -549,6 +725,7 @@ class ZT30Dashboard(tk.Tk):
 
     def _on_close(self):
         self.live_attitude.set(False)
+        self._stop_joystick()
         self.main_stream.stop()
         self.sub_stream.stop()
         if self.client is not None:

@@ -68,6 +68,7 @@ The included Tkinter dashboard provides:
 - Connection setting
 - Main stream and sub stream panels
 - Gimbal yaw and pitch movement buttons
+- Joystick pan and tilt control through `/dev/input/js0`
 - Center command
 - Angle control
 - Live attitude telemetry
@@ -104,6 +105,20 @@ python3 -m pip install Pillow
 ```
 
 If `ffplay` is available from the FFmpeg package, the dashboard can also open a stream in an external FFplay window.
+
+Joystick control uses the Linux joystick event device directly:
+
+```text
+Device : /dev/input/js0
+Axis 4 : pan, negative left and positive right
+Axis 5 : tilt, negative down and positive up
+```
+
+If the dashboard reports permission denied, add your user to the input group and log in again:
+
+```bash
+sudo usermod -aG input "$USER"
+```
 
 
 ## Network setup
