@@ -317,7 +317,7 @@ class ZT30QtDashboard(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("ZT30 Dashboard")
+        self.setWindowTitle("ZT30 Control")
         self.resize(1440, 900)
         self.client: Optional[ZT30UDPClient] = None
         self.main_thread: Optional[FFmpegStreamThread] = None
@@ -342,38 +342,11 @@ class ZT30QtDashboard(QMainWindow):
         shell.setContentsMargins(20, 18, 20, 20)
         shell.setSpacing(14)
 
-        shell.addLayout(self._build_header())
-
         content = QHBoxLayout()
         content.setSpacing(14)
         content.addLayout(self._build_video_column(), 1)
         content.addWidget(self._build_control_panel(), 0)
         shell.addLayout(content, 1)
-
-    def _build_header(self):
-        header = QHBoxLayout()
-        title_box = QVBoxLayout()
-        title = QLabel("ZT30 Dashboard")
-        title.setObjectName("title")
-        subtitle = QLabel("Clean control surface focused on the live camera feed")
-        subtitle.setObjectName("subtitle")
-        title_box.addWidget(title)
-        title_box.addWidget(subtitle)
-        header.addLayout(title_box, 1)
-
-        self.host_edit = QLineEdit(DEFAULT_IP)
-        self.host_edit.setFixedWidth(150)
-        self.port_spin = QSpinBox()
-        self.port_spin.setRange(1, 65535)
-        self.port_spin.setValue(DEFAULT_PORT)
-        reconnect = QPushButton("Connect")
-        reconnect.clicked.connect(self._connect_client)
-        header.addWidget(QLabel("Camera IP"))
-        header.addWidget(self.host_edit)
-        header.addWidget(QLabel("UDP Port"))
-        header.addWidget(self.port_spin)
-        header.addWidget(reconnect)
-        return header
 
     def _build_video_column(self):
         column = QVBoxLayout()
@@ -416,7 +389,7 @@ class ZT30QtDashboard(QMainWindow):
     def _build_control_panel(self):
         wrapper = QFrame()
         wrapper.setObjectName("controlWrapper")
-        wrapper.setFixedWidth(420)
+        wrapper.setFixedWidth(470)
         wrapper_layout = QVBoxLayout(wrapper)
         wrapper_layout.setContentsMargins(0, 0, 0, 0)
         wrapper_layout.setSpacing(8)
@@ -437,17 +410,18 @@ class ZT30QtDashboard(QMainWindow):
         scroll.setObjectName("controlScroll")
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.NoFrame)
-        scroll.setFixedWidth(400)
+        scroll.setFixedWidth(450)
         self.control_scroll = scroll
         self.control_wrapper = wrapper
 
         panel = QFrame()
         panel.setObjectName("sidePanel")
-        panel.setFixedWidth(380)
+        panel.setFixedWidth(430)
         layout = QVBoxLayout(panel)
         layout.setContentsMargins(16, 16, 16, 16)
         layout.setSpacing(12)
 
+        layout.addWidget(self._build_connection_controls())
         layout.addWidget(self._build_quick_actions())
         layout.addWidget(self._build_gimbal_controls())
         layout.addWidget(self._build_camera_controls())
@@ -468,8 +442,27 @@ class ZT30QtDashboard(QMainWindow):
     def toggle_sidebar(self):
         expanded = self.sidebar_toggle.isChecked()
         self.control_scroll.setVisible(expanded)
-        self.control_wrapper.setFixedWidth(420 if expanded else 48)
+        self.control_wrapper.setFixedWidth(470 if expanded else 48)
         self.sidebar_toggle.setText("Controls  <" if expanded else ">")
+
+    def _build_connection_controls(self):
+        box = self._section("Connection")
+        grid = QGridLayout()
+        self.host_edit = QLineEdit(DEFAULT_IP)
+        self.host_edit.setMinimumWidth(180)
+        self.port_spin = QSpinBox()
+        self.port_spin.setRange(1, 65535)
+        self.port_spin.setValue(DEFAULT_PORT)
+        self.port_spin.setMinimumWidth(100)
+        reconnect = QPushButton("Connect")
+        reconnect.clicked.connect(self._connect_client)
+        grid.addWidget(QLabel("Camera IP"), 0, 0)
+        grid.addWidget(self.host_edit, 0, 1, 1, 2)
+        grid.addWidget(QLabel("UDP Port"), 1, 0)
+        grid.addWidget(self.port_spin, 1, 1)
+        grid.addWidget(reconnect, 1, 2)
+        box.layout().addLayout(grid)
+        return box
 
     def _build_quick_actions(self):
         box = self._section("Quick Actions")
@@ -537,13 +530,13 @@ class ZT30QtDashboard(QMainWindow):
         box = self._section("Camera")
 
         zoom_row = QHBoxLayout()
-        zoom_out = self._press_button("Zoom Out", self.client_zoom_out, self.client_zoom_stop)
-        zoom_in = self._press_button("Zoom In", self.client_zoom_in, self.client_zoom_stop)
+        zoom_out = self._press_button("Zoom -", self.client_zoom_out, self.client_zoom_stop)
+        zoom_in = self._press_button("Zoom +", self.client_zoom_in, self.client_zoom_stop)
         self.zoom_spin = QDoubleSpinBox()
         self.zoom_spin.setRange(1.0, 30.9)
         self.zoom_spin.setSingleStep(0.5)
         self.zoom_spin.setValue(4.5)
-        set_zoom = QPushButton("Set")
+        set_zoom = QPushButton("Set Zoom")
         set_zoom.clicked.connect(lambda: self.run_command("set zoom", lambda: self.client.absolute_zoom(self.zoom_spin.value())))
         zoom_row.addWidget(zoom_out)
         zoom_row.addWidget(zoom_in)
@@ -552,8 +545,8 @@ class ZT30QtDashboard(QMainWindow):
         box.layout().addLayout(zoom_row)
 
         focus_row = QHBoxLayout()
-        focus_row.addWidget(self._press_button("Focus Near", self.client_focus_near, self.client_focus_stop))
-        focus_row.addWidget(self._press_button("Focus Far", self.client_focus_far, self.client_focus_stop))
+        focus_row.addWidget(self._press_button("Near Focus", self.client_focus_near, self.client_focus_stop))
+        focus_row.addWidget(self._press_button("Far Focus", self.client_focus_far, self.client_focus_stop))
         box.layout().addLayout(focus_row)
 
         self.view_combo = QComboBox()
@@ -583,14 +576,18 @@ class ZT30QtDashboard(QMainWindow):
         self.temp_y_spin = QSpinBox()
         self.temp_y_spin.setRange(0, 1080)
         self.temp_y_spin.setValue(256)
-        point_temp = QPushButton("Point Temp")
+        temp_coord_row = QHBoxLayout()
+        temp_coord_row.addWidget(QLabel("Point X"))
+        temp_coord_row.addWidget(self.temp_x_spin)
+        temp_coord_row.addWidget(QLabel("Y"))
+        temp_coord_row.addWidget(self.temp_y_spin)
+        box.layout().addLayout(temp_coord_row)
+
+        temp_row = QHBoxLayout()
+        point_temp = QPushButton("Point")
         point_temp.clicked.connect(lambda: self.run_command("point temperature", lambda: self.client.request_temperature_point(self.temp_x_spin.value(), self.temp_y_spin.value())))
-        full_temp = QPushButton("Full Temp")
+        full_temp = QPushButton("Full")
         full_temp.clicked.connect(lambda: self.run_command("full temperature", self.client.request_temperature_full_image))
-        temp_row.addWidget(QLabel("X"))
-        temp_row.addWidget(self.temp_x_spin)
-        temp_row.addWidget(QLabel("Y"))
-        temp_row.addWidget(self.temp_y_spin)
         temp_row.addWidget(point_temp)
         temp_row.addWidget(full_temp)
         box.layout().addLayout(temp_row)
@@ -599,13 +596,13 @@ class ZT30QtDashboard(QMainWindow):
     def _build_laser_controls(self):
         box = self._section("Laser Rangefinder")
         row = QHBoxLayout()
-        laser_on = QPushButton("Laser On")
+        laser_on = QPushButton("On")
         laser_on.clicked.connect(lambda: self.run_command("laser on", lambda: self.client.set_laser(True)))
-        laser_off = QPushButton("Laser Off")
+        laser_off = QPushButton("Off")
         laser_off.clicked.connect(lambda: self.run_command("laser off", lambda: self.client.set_laser(False)))
-        measure = QPushButton("Measure")
+        measure = QPushButton("Range")
         measure.clicked.connect(lambda: self.run_command("laser range", self.client.request_laser_range))
-        target = QPushButton("Target GPS")
+        target = QPushButton("GPS")
         target.clicked.connect(lambda: self.run_command("laser target", self.client.request_laser_target_latlon))
         row.addWidget(laser_on)
         row.addWidget(laser_off)
@@ -860,14 +857,6 @@ class ZT30QtDashboard(QMainWindow):
                 font-family: Inter, Segoe UI, Arial;
                 font-size: 13px;
             }
-            #title {
-                font-size: 26px;
-                font-weight: 700;
-                color: #f6f8fb;
-            }
-            #subtitle {
-                color: #9aa6b2;
-            }
             QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox {
                 background: #151b22;
                 border: 1px solid #2a3440;
@@ -1006,7 +995,7 @@ class ZT30QtDashboard(QMainWindow):
 
 def main():
     app = QApplication(sys.argv)
-    app.setApplicationName("ZT30 Dashboard")
+    app.setApplicationName("ZT30 Control")
     app.setFont(QFont("Inter", 10))
     window = ZT30QtDashboard()
     window.show()
