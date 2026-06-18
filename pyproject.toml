@@ -10,7 +10,7 @@ requires-python = ">=3.9"
 authors = [{name = "Internal SDK"}]
 
 [project.optional-dependencies]
-ui = ["Pillow>=10"]
+ui = ["PyQt5>=5.15", "Pillow>=10"]
 
 [tool.setuptools.packages.find]
 where = ["."]

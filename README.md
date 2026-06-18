@@ -63,20 +63,22 @@ Implemented HTTP helpers:
 
 ### UI
 
-The included Tkinter dashboard provides:
+The included PyQt5 dashboard provides:
 
 - Connection setting
-- Main stream and sub stream panels
-- Gimbal yaw and pitch movement buttons
+- Large main live view focused on the video stream
+- Switchable Video 1 / Video 2 live stream
+- Optional picture-in-picture view between Video 1 and Video 2
+- Gimbal pan and tilt movement buttons
 - Joystick pan and tilt control through `/dev/input/js0`
 - Center command
 - Angle control
 - Live attitude telemetry
 - Zoom and focus controls
 - Photo and record buttons
-- Image mode selector
+- Camera view selector with common names
 - Laser rangefinder controls
-- Thermal palette and gain controls
+- Thermal palette controls
 - Full image and point thermometric request
 - Maintenance buttons
 - Embedded RTSP playback through `ffmpeg`, with optional external `ffplay`
@@ -86,10 +88,10 @@ The included Tkinter dashboard provides:
 Python 3.9 or newer is recommended.
 
 The SDK uses only Python standard library.
-The UI uses Tkinter, which is included in most Python installations. On Ubuntu or Debian, install it with:
+The modern dashboard uses PyQt5. Install the UI dependencies with:
 
 ```bash
-sudo apt install python3-tk
+python3 -m pip install ".[ui]"
 ```
 
 To decode RTSP streams in the dashboard, install FFmpeg:
@@ -98,10 +100,10 @@ To decode RTSP streams in the dashboard, install FFmpeg:
 sudo apt install ffmpeg
 ```
 
-The dashboard uses Pillow to display decoded FFmpeg frames in Tkinter:
+If you install packages manually instead of using `.[ui]`, install PyQt5:
 
 ```bash
-python3 -m pip install Pillow
+python3 -m pip install PyQt5
 ```
 
 If `ffplay` is available from the FFmpeg package, the dashboard can also open a stream in an external FFplay window.
@@ -152,12 +154,13 @@ python3 examples/basic_control.py
 From the package root:
 
 ```bash
-python3 ui/zt30_dashboard_ui.py
+python3 ui/zt30_dashboard_qt.py
 ```
 
-The original compact UI is still available:
+The original Tkinter UI is still available as a fallback:
 
 ```bash
+python3 ui/zt30_dashboard_ui.py
 python3 ui/zt30_control_ui.py
 ```
 
