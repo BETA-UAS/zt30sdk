@@ -13,8 +13,8 @@ import time
 from pathlib import Path
 from typing import Callable, Optional
 
-from PyQt5.QtCore import QThread, QTimer, Qt, pyqtSignal
-from PyQt5.QtGui import QFont, QImage, QKeySequence, QPixmap
+from PyQt5.QtCore import QLibraryInfo, QPoint, QRect, QSize, QThread, QTimer, Qt, pyqtSignal
+from PyQt5.QtGui import QColor, QFont, QImage, QKeySequence, QPainter, QPen, QPixmap
 from PyQt5.QtWidgets import (
     QApplication,
     QButtonGroup,
@@ -34,12 +34,13 @@ from PyQt5.QtWidgets import (
     QSizePolicy,
     QSlider,
     QSpinBox,
-    QStackedWidget,
     QTextEdit,
     QToolButton,
     QVBoxLayout,
     QWidget,
 )
+
+os.environ["QT_QPA_PLATFORM_PLUGIN_PATH"] = QLibraryInfo.location(QLibraryInfo.PluginsPath)
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -50,7 +51,7 @@ from siyi_zt30.constants import IMAGE_MODE_BY_NAME, IMAGE_MODES, THERMAL_PALETTE
 
 
 STREAM_SIZE = (960, 540)
-PIP_SIZE = (320, 180)
+PIP_SIZE_DEFAULT = (320, 180)
 
 CAMERA_VIEWS = {
     "Zoom + Thermal": "single_zoom_sub_thermal",
@@ -107,6 +108,7 @@ class FFmpegStreamThread(QThread):
             f"fps=20,scale={self.width}:{self.height}:force_original_aspect_ratio=decrease,"
             f"pad={self.width}:{self.height}:(ow-iw)/2:(oh-ih)/2"
         )
+
         cmd = [
             "ffmpeg",
             "-hide_banner",
@@ -132,6 +134,7 @@ class FFmpegStreamThread(QThread):
 
         self._running = True
         self.status_changed.emit("Connecting")
+
         try:
             self._process = subprocess.Popen(
                 cmd,
@@ -139,15 +142,27 @@ class FFmpegStreamThread(QThread):
                 stderr=subprocess.PIPE,
                 bufsize=frame_bytes * 2,
             )
+
             self.status_changed.emit("Live")
+
             while self._running and self._process.stdout is not None:
                 frame = self._read_exact(frame_bytes)
                 if frame is None:
                     break
-                image = QImage(frame, self.width, self.height, self.width * 3, QImage.Format_RGB888).copy()
+
+                image = QImage(
+                    frame,
+                    self.width,
+                    self.height,
+                    self.width * 3,
+                    QImage.Format_RGB888,
+                ).copy()
+
                 self.frame_ready.emit(image)
+
         except Exception as exc:
             self.error.emit(str(exc))
+
         finally:
             self._stop_process()
             if self._running:
@@ -156,12 +171,15 @@ class FFmpegStreamThread(QThread):
     def _read_exact(self, size: int):
         if self._process is None or self._process.stdout is None:
             return None
+
         data = bytearray()
+
         while self._running and len(data) < size:
             chunk = self._process.stdout.read(size - len(data))
             if not chunk:
                 return None
             data.extend(chunk)
+
         return bytes(data)
 
     def stop(self):
@@ -172,6 +190,7 @@ class FFmpegStreamThread(QThread):
     def _stop_process(self):
         if self._process is None:
             return
+
         try:
             self._process.terminate()
             self._process.wait(timeout=1.0)
@@ -180,6 +199,7 @@ class FFmpegStreamThread(QThread):
                 self._process.kill()
             except Exception:
                 pass
+
         self._process = None
 
 
@@ -188,7 +208,13 @@ class JoystickThread(QThread):
     status_changed = pyqtSignal(str)
     message = pyqtSignal(str)
 
-    def __init__(self, device: str, speed_getter: Callable[[], int], deadzone_getter: Callable[[], int], parent=None):
+    def __init__(
+        self,
+        device: str,
+        speed_getter: Callable[[], int],
+        deadzone_getter: Callable[[], int],
+        parent=None,
+    ):
         super().__init__(parent)
         self.device = device
         self.speed_getter = speed_getter
@@ -200,11 +226,13 @@ class JoystickThread(QThread):
         event_size = struct.calcsize("IhBB")
         fd = None
         self._running = True
+
         try:
             fd = os.open(self.device, os.O_RDONLY | os.O_NONBLOCK)
             self.status_changed.emit("Active")
             self.message.emit(f"Joystick active: {self.device}")
             next_send = 0.0
+
             while self._running:
                 try:
                     data = os.read(fd, event_size)
@@ -218,18 +246,26 @@ class JoystickThread(QThread):
 
                 now = time.monotonic()
                 if now >= next_send:
-                    self.speed_changed.emit(self._axis_to_speed(self._axes[4]), self._axis_to_speed(self._axes[5]))
+                    self.speed_changed.emit(
+                        self._axis_to_speed(self._axes[4]),
+                        self._axis_to_speed(self._axes[5]),
+                    )
                     next_send = now + 0.10
+
                 time.sleep(0.01)
+
         except FileNotFoundError:
             self.status_changed.emit("Missing")
             self.message.emit(f"Joystick not found: {self.device}")
+
         except PermissionError:
             self.status_changed.emit("No access")
             self.message.emit(f"Joystick permission denied: {self.device}")
+
         except OSError as exc:
             self.status_changed.emit("Error")
             self.message.emit(f"Joystick error: {exc}")
+
         finally:
             if fd is not None:
                 os.close(fd)
@@ -244,28 +280,52 @@ class JoystickThread(QThread):
         deadzone = clamp(self.deadzone_getter(), 0, 32000)
         value = clamp(value, -32767, 32767)
         magnitude = abs(value)
+
         if magnitude <= deadzone:
             return 0
+
         scaled = round(((magnitude - deadzone) / max(1, 32767 - deadzone)) * speed_limit)
         return clamp(scaled, 0, speed_limit) * (1 if value > 0 else -1)
 
 
+class ClickableVideoLabel(QLabel):
+    clicked = pyqtSignal()
+
+    def __init__(self, text: str = ""):
+        super().__init__(text)
+        self._last_pixmap: Optional[QPixmap] = None
+
+    def setPixmap(self, pixmap: QPixmap):
+        self._last_pixmap = pixmap
+        super().setPixmap(pixmap)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self.clicked.emit()
+            return
+
+        super().mouseReleaseEvent(event)
+
+
 class VideoStage(QFrame):
+    pip_clicked = pyqtSignal()
+
     def __init__(self):
         super().__init__()
         self.setObjectName("videoStage")
         self.setMinimumSize(780, 440)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
 
-        self.main_label = QLabel("Select Play to start the stream")
+        self.main_label = ClickableVideoLabel("Select Play to start the stream")
         self.main_label.setObjectName("mainVideo")
         self.main_label.setAlignment(Qt.AlignCenter)
         self.main_label.setScaledContents(False)
 
-        self.pip_label = QLabel("PiP")
+        self.pip_label = ClickableVideoLabel("PiP")
         self.pip_label.setObjectName("pipVideo")
         self.pip_label.setAlignment(Qt.AlignCenter)
-        self.pip_label.setFixedSize(*PIP_SIZE)
+        self.pip_label.setFixedSize(*PIP_SIZE_DEFAULT)
+        self.pip_label.clicked.connect(self.pip_clicked.emit)
         self.pip_label.hide()
 
         layout = QGridLayout(self)
@@ -275,6 +335,7 @@ class VideoStage(QFrame):
 
         self._main_pixmap: Optional[QPixmap] = None
         self._pip_pixmap: Optional[QPixmap] = None
+        self._laser_overlay_lines = []
 
     def set_main_frame(self, image: QImage):
         self._main_pixmap = QPixmap.fromImage(image)
@@ -296,48 +357,132 @@ class VideoStage(QFrame):
         else:
             self.pip_label.hide()
 
+    def set_pip_size(self, width: int):
+        width = clamp(width, 160, 640)
+        height = round(width * 9 / 16)
+        self.pip_label.setFixedSize(QSize(width, height))
+        self._refresh_pixmaps()
+
+    def set_laser_overlay(self, lines):
+        self._laser_overlay_lines = [line for line in lines if line]
+        self._refresh_pixmaps()
+
+    def clear_laser_overlay(self):
+        self._laser_overlay_lines = []
+        self._refresh_pixmaps()
+
     def resizeEvent(self, event):
         super().resizeEvent(event)
         self._refresh_pixmaps()
 
     def _refresh_pixmaps(self):
         if self._main_pixmap:
-            self.main_label.setPixmap(
-                self._main_pixmap.scaled(self.main_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            pixmap = self._main_pixmap.scaled(
+                self.main_label.size(),
+                Qt.KeepAspectRatio,
+                Qt.SmoothTransformation,
             )
+            self._draw_main_overlay(pixmap)
+            self.main_label.setPixmap(pixmap)
+
         if self._pip_pixmap:
             self.pip_label.setPixmap(
-                self._pip_pixmap.scaled(self.pip_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                self._pip_pixmap.scaled(
+                    self.pip_label.size(),
+                    Qt.KeepAspectRatio,
+                    Qt.SmoothTransformation,
+                )
             )
 
+    def _draw_main_overlay(self, pixmap: QPixmap):
+        if pixmap.isNull():
+            return
+
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.Antialiasing)
+
+        cx = pixmap.width() // 2
+        cy = pixmap.height() // 2
+        arm = max(24, min(pixmap.width(), pixmap.height()) // 14)
+        gap = 8
+
+        shadow = QPen(QColor(0, 0, 0, 190), 4)
+        painter.setPen(shadow)
+        painter.drawLine(cx - arm, cy, cx - gap, cy)
+        painter.drawLine(cx + gap, cy, cx + arm, cy)
+        painter.drawLine(cx, cy - arm, cx, cy - gap)
+        painter.drawLine(cx, cy + gap, cx, cy + arm)
+        painter.drawEllipse(QPoint(cx, cy), 3, 3)
+
+        pen = QPen(QColor("#f7d84a"), 2)
+        painter.setPen(pen)
+        painter.drawLine(cx - arm, cy, cx - gap, cy)
+        painter.drawLine(cx + gap, cy, cx + arm, cy)
+        painter.drawLine(cx, cy - arm, cx, cy - gap)
+        painter.drawLine(cx, cy + gap, cx, cy + arm)
+        painter.drawEllipse(QPoint(cx, cy), 3, 3)
+
+        if self._laser_overlay_lines:
+            painter.setFont(QFont("Inter", 10, QFont.DemiBold))
+            metrics = painter.fontMetrics()
+            line_height = metrics.height()
+            width = max(metrics.horizontalAdvance(line) for line in self._laser_overlay_lines) + 22
+            height = line_height * len(self._laser_overlay_lines) + 18
+            rect = QRect(14, 14, width, height)
+            painter.fillRect(rect, QColor(3, 5, 7, 185))
+            painter.setPen(QPen(QColor("#2db69c"), 1))
+            painter.drawRect(rect)
+            painter.setPen(QPen(QColor("#eef3f7"), 1))
+            y = rect.y() + 12 + metrics.ascent()
+            for line in self._laser_overlay_lines:
+                painter.drawText(rect.x() + 11, y, line)
+                y += line_height
+
+        painter.end()
 
 class ZT30QtDashboard(QMainWindow):
     log_signal = pyqtSignal(str)
     telemetry_signal = pyqtSignal(object, object)
+    laser_overlay_signal = pyqtSignal(object)
 
     def __init__(self):
         super().__init__()
         self.setWindowTitle("ZT30 Control")
         self.resize(1440, 900)
+
         self.client: Optional[ZT30UDPClient] = None
+        self.connected_host = ""
+        self.connected_port = 0
+
         self.main_thread: Optional[FFmpegStreamThread] = None
         self.pip_thread: Optional[FFmpegStreamThread] = None
         self.joystick_thread: Optional[JoystickThread] = None
         self.last_joystick_speed = (None, None)
+        self.laser_enabled = False
+        self.laser_range: Optional[float] = None
+        self.laser_target = None
 
         self._build_ui()
         self._apply_style()
+
         self.log_signal.connect(self.log.append)
         self.telemetry_signal.connect(self._apply_telemetry)
-        self._connect_client()
+        self.laser_overlay_signal.connect(self._apply_laser_overlay)
+
+        self._ensure_client()
 
         self.telemetry_timer = QTimer(self)
         self.telemetry_timer.timeout.connect(self.refresh_status)
         self.telemetry_timer.start(1500)
 
+        self.laser_timer = QTimer(self)
+        self.laser_timer.timeout.connect(self.refresh_laser_overlay)
+        self.laser_timer.start(2500)
+
     def _build_ui(self):
         root = QWidget()
         self.setCentralWidget(root)
+
         shell = QVBoxLayout(root)
         shell.setContentsMargins(20, 18, 20, 20)
         shell.setSpacing(14)
@@ -346,6 +491,7 @@ class ZT30QtDashboard(QMainWindow):
         content.setSpacing(14)
         content.addLayout(self._build_video_column(), 1)
         content.addWidget(self._build_control_panel(), 0)
+
         shell.addLayout(content, 1)
 
     def _build_video_column(self):
@@ -359,49 +505,72 @@ class ZT30QtDashboard(QMainWindow):
         tools.setSpacing(10)
 
         self.stream_group = QButtonGroup(self)
+
         self.video1_btn = self._chip("Video 1", True)
         self.video2_btn = self._chip("Video 2", False)
+
         self.stream_group.addButton(self.video1_btn, 1)
         self.stream_group.addButton(self.video2_btn, 2)
+
         tools.addWidget(QLabel("Live view"))
         tools.addWidget(self.video1_btn)
         tools.addWidget(self.video2_btn)
 
         self.pip_check = QCheckBox("Picture in Picture")
+        self.pip_check.setChecked(True)
+        self.pip_check.toggled.connect(self.handle_pip_toggle)
         tools.addWidget(self.pip_check)
+
+        tools.addWidget(QLabel("PiP Size"))
+        self.pip_size_slider = QSlider(Qt.Horizontal)
+        self.pip_size_slider.setRange(160, 520)
+        self.pip_size_slider.setValue(PIP_SIZE_DEFAULT[0])
+        self.pip_size_slider.setFixedWidth(120)
+        self.pip_size_slider.valueChanged.connect(lambda value: self.video_stage.set_pip_size(value))
+        tools.addWidget(self.pip_size_slider)
+
         self.status_badge = QLabel("Idle")
         self.status_badge.setObjectName("statusBadge")
         tools.addWidget(self.status_badge)
+
         tools.addStretch(1)
 
-        play = QPushButton("Play")
+        play = QPushButton("Connect + Play")
         play.clicked.connect(self.start_streams)
+
         stop = QPushButton("Stop")
         stop.clicked.connect(self.stop_streams)
+
         tools.addWidget(play)
         tools.addWidget(stop)
 
         self.video_stage = VideoStage()
+        self.video_stage.pip_clicked.connect(self.swap_pip_view)
+
         column.addWidget(toolbar)
         column.addWidget(self.video_stage, 1)
+
         return column
 
     def _build_control_panel(self):
         wrapper = QFrame()
         wrapper.setObjectName("controlWrapper")
         wrapper.setFixedWidth(470)
+
         wrapper_layout = QVBoxLayout(wrapper)
         wrapper_layout.setContentsMargins(0, 0, 0, 0)
         wrapper_layout.setSpacing(8)
 
         toggle_row = QHBoxLayout()
         toggle_row.setContentsMargins(0, 0, 0, 0)
+
         self.sidebar_toggle = QToolButton()
         self.sidebar_toggle.setObjectName("sidebarToggle")
         self.sidebar_toggle.setText("Controls  <")
         self.sidebar_toggle.setCheckable(True)
         self.sidebar_toggle.setChecked(True)
         self.sidebar_toggle.clicked.connect(self.toggle_sidebar)
+
         toggle_row.addStretch(1)
         toggle_row.addWidget(self.sidebar_toggle)
         wrapper_layout.addLayout(toggle_row)
@@ -411,12 +580,14 @@ class ZT30QtDashboard(QMainWindow):
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.NoFrame)
         scroll.setFixedWidth(450)
+
         self.control_scroll = scroll
         self.control_wrapper = wrapper
 
         panel = QFrame()
         panel.setObjectName("sidePanel")
         panel.setFixedWidth(430)
+
         layout = QVBoxLayout(panel)
         layout.setContentsMargins(16, 16, 16, 16)
         layout.setSpacing(12)
@@ -434,9 +605,12 @@ class ZT30QtDashboard(QMainWindow):
         self.log.setReadOnly(True)
         self.log.setFixedHeight(120)
         layout.addWidget(self.log)
+
         layout.addStretch(1)
+
         scroll.setWidget(panel)
         wrapper_layout.addWidget(scroll, 1)
+
         return wrapper
 
     def toggle_sidebar(self):
@@ -448,81 +622,122 @@ class ZT30QtDashboard(QMainWindow):
     def _build_connection_controls(self):
         box = self._section("Connection")
         grid = QGridLayout()
+
         self.host_edit = QLineEdit(DEFAULT_IP)
         self.host_edit.setMinimumWidth(180)
+
         self.port_spin = QSpinBox()
         self.port_spin.setRange(1, 65535)
         self.port_spin.setValue(DEFAULT_PORT)
         self.port_spin.setMinimumWidth(100)
-        reconnect = QPushButton("Connect")
-        reconnect.clicked.connect(self._connect_client)
+
+        reconnect = QPushButton("Connect UDP")
+        reconnect.clicked.connect(lambda: self._ensure_client(force=True))
+
+        connect_play = QPushButton("Connect + Play")
+        connect_play.clicked.connect(self.start_streams)
+
         grid.addWidget(QLabel("Camera IP"), 0, 0)
         grid.addWidget(self.host_edit, 0, 1, 1, 2)
+
         grid.addWidget(QLabel("UDP Port"), 1, 0)
         grid.addWidget(self.port_spin, 1, 1)
         grid.addWidget(reconnect, 1, 2)
+
+        grid.addWidget(connect_play, 2, 1, 1, 2)
+
         box.layout().addLayout(grid)
         return box
 
     def _build_quick_actions(self):
         box = self._section("Quick Actions")
         row = QHBoxLayout()
+
         photo = QPushButton("Photo")
         photo.clicked.connect(lambda: self.run_command("photo", self.client.take_photo))
+
         record = QPushButton("Record")
         record.clicked.connect(lambda: self.run_command("record", self.client.toggle_record))
+
         focus = QPushButton("Auto Focus")
         focus.clicked.connect(lambda: self.run_command("auto focus", self.client.auto_focus))
+
         row.addWidget(photo)
         row.addWidget(record)
         row.addWidget(focus)
+
         box.layout().addLayout(row)
         return box
 
     def _build_gimbal_controls(self):
         box = self._section("Gimbal")
+
         self.speed_slider = QSlider(Qt.Horizontal)
         self.speed_slider.setRange(5, 100)
         self.speed_slider.setValue(35)
+
         speed_row = QHBoxLayout()
         speed_row.addWidget(QLabel("Speed"))
         speed_row.addWidget(self.speed_slider, 1)
+
         self.speed_label = QLabel("35")
         self.speed_slider.valueChanged.connect(lambda value: self.speed_label.setText(str(value)))
         speed_row.addWidget(self.speed_label)
+
         box.layout().addLayout(speed_row)
 
         pad = QGridLayout()
+
         pad.addWidget(self._hold_button("Up", 0, 1), 0, 1)
         pad.addWidget(self._hold_button("Left", -1, 0), 1, 0)
+
         center = QPushButton("Center")
         center.clicked.connect(lambda: self.run_command("center", self.client.center))
         pad.addWidget(center, 1, 1)
+
         pad.addWidget(self._hold_button("Right", 1, 0), 1, 2)
         pad.addWidget(self._hold_button("Down", 0, -1), 2, 1)
+
         box.layout().addLayout(pad)
 
         modes = QHBoxLayout()
+
         for label, mode in (("Lock", "lock"), ("Follow", "follow"), ("FPV", "fpv")):
             btn = QPushButton(label)
-            btn.clicked.connect(lambda _checked=False, value=mode: self.run_command(f"{value} mode", lambda: self.client.set_motion_mode(value)))
+            btn.clicked.connect(
+                lambda _checked=False, value=mode: self.run_command(
+                    f"{value} mode",
+                    lambda: self.client.set_motion_mode(value),
+                )
+            )
             modes.addWidget(btn)
+
         box.layout().addLayout(modes)
 
         angle_row = QHBoxLayout()
+
         self.yaw_spin = QDoubleSpinBox()
         self.yaw_spin.setRange(-180.0, 180.0)
         self.yaw_spin.setSuffix(" deg")
+
         self.pitch_spin = QDoubleSpinBox()
         self.pitch_spin.setRange(-90.0, 90.0)
         self.pitch_spin.setSuffix(" deg")
+
         set_angle = QPushButton("Set Angle")
-        set_angle.clicked.connect(lambda: self.run_command("set angle", lambda: self.client.set_angle(self.yaw_spin.value(), self.pitch_spin.value())))
+        set_angle.clicked.connect(
+            lambda: self.run_command(
+                "set angle",
+                lambda: self.client.set_angle(self.yaw_spin.value(), self.pitch_spin.value()),
+            )
+        )
+
         angle_row.addWidget(QLabel("Pan"))
         angle_row.addWidget(self.yaw_spin)
         angle_row.addWidget(QLabel("Tilt"))
         angle_row.addWidget(self.pitch_spin)
         angle_row.addWidget(set_angle)
+
         box.layout().addLayout(angle_row)
         return box
 
@@ -530,18 +745,28 @@ class ZT30QtDashboard(QMainWindow):
         box = self._section("Camera")
 
         zoom_row = QHBoxLayout()
+
         zoom_out = self._press_button("Zoom -", self.client_zoom_out, self.client_zoom_stop)
         zoom_in = self._press_button("Zoom +", self.client_zoom_in, self.client_zoom_stop)
+
         self.zoom_spin = QDoubleSpinBox()
         self.zoom_spin.setRange(1.0, 30.9)
         self.zoom_spin.setSingleStep(0.5)
         self.zoom_spin.setValue(4.5)
+
         set_zoom = QPushButton("Set Zoom")
-        set_zoom.clicked.connect(lambda: self.run_command("set zoom", lambda: self.client.absolute_zoom(self.zoom_spin.value())))
+        set_zoom.clicked.connect(
+            lambda: self.run_command(
+                "set zoom",
+                lambda: self.client.absolute_zoom(self.zoom_spin.value()),
+            )
+        )
+
         zoom_row.addWidget(zoom_out)
         zoom_row.addWidget(zoom_in)
         zoom_row.addWidget(self.zoom_spin)
         zoom_row.addWidget(set_zoom)
+
         box.layout().addLayout(zoom_row)
 
         focus_row = QHBoxLayout()
@@ -551,104 +776,150 @@ class ZT30QtDashboard(QMainWindow):
 
         self.view_combo = QComboBox()
         self.view_combo.addItems(CAMERA_VIEWS.keys())
+
         apply_view = QPushButton("Apply View")
         apply_view.clicked.connect(self.apply_camera_view)
+
         view_row = QHBoxLayout()
         view_row.addWidget(QLabel("View"))
         view_row.addWidget(self.view_combo, 1)
         view_row.addWidget(apply_view)
+
         box.layout().addLayout(view_row)
 
         self.palette_combo = QComboBox()
         self.palette_combo.addItems(THERMAL_NAMES.keys())
+
         palette_btn = QPushButton("Set Palette")
         palette_btn.clicked.connect(self.apply_palette)
+
         thermal_row = QHBoxLayout()
         thermal_row.addWidget(QLabel("Thermal"))
         thermal_row.addWidget(self.palette_combo, 1)
         thermal_row.addWidget(palette_btn)
+
         box.layout().addLayout(thermal_row)
 
-        temp_row = QHBoxLayout()
         self.temp_x_spin = QSpinBox()
         self.temp_x_spin.setRange(0, 1920)
         self.temp_x_spin.setValue(320)
+
         self.temp_y_spin = QSpinBox()
         self.temp_y_spin.setRange(0, 1080)
         self.temp_y_spin.setValue(256)
+
         temp_coord_row = QHBoxLayout()
         temp_coord_row.addWidget(QLabel("Point X"))
         temp_coord_row.addWidget(self.temp_x_spin)
         temp_coord_row.addWidget(QLabel("Y"))
         temp_coord_row.addWidget(self.temp_y_spin)
+
         box.layout().addLayout(temp_coord_row)
 
         temp_row = QHBoxLayout()
+
         point_temp = QPushButton("Point")
-        point_temp.clicked.connect(lambda: self.run_command("point temperature", lambda: self.client.request_temperature_point(self.temp_x_spin.value(), self.temp_y_spin.value())))
+        point_temp.clicked.connect(
+            lambda: self.run_command(
+                "point temperature",
+                lambda: self.client.request_temperature_point(
+                    self.temp_x_spin.value(),
+                    self.temp_y_spin.value(),
+                ),
+            )
+        )
+
         full_temp = QPushButton("Full")
-        full_temp.clicked.connect(lambda: self.run_command("full temperature", self.client.request_temperature_full_image))
+        full_temp.clicked.connect(
+            lambda: self.run_command(
+                "full temperature",
+                self.client.request_temperature_full_image,
+            )
+        )
+
         temp_row.addWidget(point_temp)
         temp_row.addWidget(full_temp)
+
         box.layout().addLayout(temp_row)
+
         return box
 
     def _build_laser_controls(self):
         box = self._section("Laser Rangefinder")
         row = QHBoxLayout()
+
         laser_on = QPushButton("On")
-        laser_on.clicked.connect(lambda: self.run_command("laser on", lambda: self.client.set_laser(True)))
+        laser_on.clicked.connect(lambda: self.set_laser_enabled(True))
+
         laser_off = QPushButton("Off")
-        laser_off.clicked.connect(lambda: self.run_command("laser off", lambda: self.client.set_laser(False)))
+        laser_off.clicked.connect(lambda: self.set_laser_enabled(False))
+
         measure = QPushButton("Range")
-        measure.clicked.connect(lambda: self.run_command("laser range", self.client.request_laser_range))
+        measure.clicked.connect(self.refresh_laser_overlay)
+
         target = QPushButton("GPS")
-        target.clicked.connect(lambda: self.run_command("laser target", self.client.request_laser_target_latlon))
+        target.clicked.connect(self.refresh_laser_overlay)
+
         row.addWidget(laser_on)
         row.addWidget(laser_off)
         row.addWidget(measure)
         row.addWidget(target)
+
         box.layout().addLayout(row)
         return box
 
     def _build_joystick_controls(self):
         box = self._section("Joystick")
+
         self.joystick_check = QCheckBox("Use /dev/input/js0")
         self.joystick_check.toggled.connect(self.toggle_joystick)
+
         self.joystick_status = QLabel("Off")
+
         top = QHBoxLayout()
         top.addWidget(self.joystick_check)
         top.addStretch(1)
         top.addWidget(self.joystick_status)
+
         box.layout().addLayout(top)
 
         self.deadzone_slider = QSlider(Qt.Horizontal)
         self.deadzone_slider.setRange(0, 16000)
         self.deadzone_slider.setValue(5000)
+
         dz = QHBoxLayout()
         dz.addWidget(QLabel("Deadzone"))
         dz.addWidget(self.deadzone_slider, 1)
+
         box.layout().addLayout(dz)
         return box
 
     def _build_status_cards(self):
         box = self._section("Status")
         grid = QGridLayout()
+
         self.yaw_value = self._metric("Yaw")
         self.pitch_value = self._metric("Pitch")
         self.roll_value = self._metric("Roll")
         self.zoom_value = self._metric("Zoom")
+
         grid.addWidget(self.yaw_value[0], 0, 0)
         grid.addWidget(self.yaw_value[1], 1, 0)
+
         grid.addWidget(self.pitch_value[0], 0, 1)
         grid.addWidget(self.pitch_value[1], 1, 1)
+
         grid.addWidget(self.roll_value[0], 2, 0)
         grid.addWidget(self.roll_value[1], 3, 0)
+
         grid.addWidget(self.zoom_value[0], 2, 1)
         grid.addWidget(self.zoom_value[1], 3, 1)
+
         box.layout().addLayout(grid)
+
         refresh = QPushButton("Refresh Status")
         refresh.clicked.connect(self.refresh_status)
+
         box.layout().addWidget(refresh)
         return box
 
@@ -661,8 +932,10 @@ class ZT30QtDashboard(QMainWindow):
     def _metric(self, name: str):
         label = QLabel(name)
         label.setObjectName("metricLabel")
+
         value = QLabel("-")
         value.setObjectName("metricValue")
+
         return label, value
 
     def _chip(self, label: str, checked: bool):
@@ -675,7 +948,12 @@ class ZT30QtDashboard(QMainWindow):
 
     def _hold_button(self, label: str, yaw_dir: int, pitch_dir: int):
         btn = QPushButton(label)
-        btn.pressed.connect(lambda: self.rotate(yaw_dir * self.speed_slider.value(), pitch_dir * self.speed_slider.value()))
+        btn.pressed.connect(
+            lambda: self.rotate(
+                yaw_dir * self.speed_slider.value(),
+                pitch_dir * self.speed_slider.value(),
+            )
+        )
         btn.released.connect(self.stop_rotation)
         return btn
 
@@ -685,22 +963,56 @@ class ZT30QtDashboard(QMainWindow):
         btn.released.connect(stop)
         return btn
 
-    def _connect_client(self):
+    def _ensure_client(self, force: bool = False):
+        host = self.host_edit.text().strip()
+        port = self.port_spin.value()
+
+        if not force and self.client and self.connected_host == host and self.connected_port == port:
+            return True
+
         self.stop_joystick()
+
         if self.client:
-            self.client.close()
-        self.client = ZT30UDPClient(self.host_edit.text().strip(), self.port_spin.value())
-        self.log_message(f"Connected to {self.client.host}:{self.client.port}")
+            try:
+                self.client.close()
+            except Exception:
+                pass
+
+        try:
+            self.client = ZT30UDPClient(host, port)
+            self.connected_host = host
+            self.connected_port = port
+            self.log_message(f"UDP ready: {host}:{port}")
+            return True
+
+        except Exception as exc:
+            self.client = None
+            self.log_message(f"UDP connect error: {exc}")
+            return False
 
     def start_streams(self):
+        if not self._ensure_client():
+            return
+
         self.stop_streams()
+
         stream = self.stream_group.checkedId() or 1
         other = 2 if stream == 1 else 1
         host = self.host_edit.text().strip()
-        self.main_thread = self._start_stream(rtsp_url(host, stream), *STREAM_SIZE, self.video_stage.set_main_frame)
+
+        self.main_thread = self._start_stream(
+            rtsp_url(host, stream),
+            *STREAM_SIZE,
+            self.video_stage.set_main_frame,
+        )
+
         if self.pip_check.isChecked():
             self.video_stage.set_pip_enabled(True)
-            self.pip_thread = self._start_stream(rtsp_url(host, other), *PIP_SIZE, self.video_stage.set_pip_frame)
+            self.pip_thread = self._start_stream(
+                rtsp_url(host, other),
+                *PIP_SIZE_DEFAULT,
+                self.video_stage.set_pip_frame,
+            )
         else:
             self.video_stage.set_pip_enabled(False)
 
@@ -717,17 +1029,114 @@ class ZT30QtDashboard(QMainWindow):
         if self.main_thread:
             self.main_thread.stop()
             self.main_thread = None
+
         if self.pip_thread:
             self.pip_thread.stop()
             self.pip_thread = None
+
         self.status_badge.setText("Idle")
-        self.video_stage.clear_main("Select Play to start the stream")
+        self.video_stage.clear_main("Select Connect + Play to start the stream")
+
+    def handle_pip_toggle(self, enabled: bool):
+        self.video_stage.set_pip_enabled(enabled)
+
+        if self.main_thread:
+            self.start_streams()
+
+    def swap_pip_view(self):
+        if not self.pip_check.isChecked():
+            return
+
+        current = self.stream_group.checkedId() or 1
+        new_main = 2 if current == 1 else 1
+
+        if new_main == 1:
+            self.video1_btn.setChecked(True)
+        else:
+            self.video2_btn.setChecked(True)
+
+        self.log_message(f"PiP clicked: switched main view to Video {new_main}")
+
+        if self.main_thread:
+            self.start_streams()
+
+    def set_laser_enabled(self, enabled: bool):
+        if not self._ensure_client():
+            return
+
+        threading.Thread(
+            target=self._laser_enable_worker,
+            args=(enabled,),
+            daemon=True,
+        ).start()
+
+    def _laser_enable_worker(self, enabled: bool):
+        try:
+            result = self.client.set_laser(enabled)
+            self.laser_enabled = enabled
+
+            if enabled:
+                self.log_message(f"laser on: {result if result is not None else 'OK'}")
+                self._update_laser_measurement()
+            else:
+                self.laser_range = None
+                self.laser_target = None
+                self.laser_overlay_signal.emit([])
+                self.log_message(f"laser off: {result if result is not None else 'OK'}")
+
+        except Exception as exc:
+            self.log_message(f"laser {'on' if enabled else 'off'}: ERROR {exc}")
+
+    def refresh_laser_overlay(self):
+        if not self.laser_enabled:
+            return
+
+        if not self._ensure_client():
+            return
+
+        threading.Thread(target=self._update_laser_measurement, daemon=True).start()
+
+    def _update_laser_measurement(self):
+        try:
+            self.laser_range = self.client.request_laser_range()
+            self.laser_target = self.client.request_laser_target_latlon()
+            self.laser_overlay_signal.emit(self._laser_overlay_lines())
+            self.log_message("laser overlay: updated")
+        except Exception as exc:
+            self.log_message(f"laser overlay: ERROR {exc}")
+
+    def _laser_overlay_lines(self):
+        lines = ["LASER RANGEFINDER"]
+
+        if self.laser_range is None:
+            lines.append("Range: -")
+        else:
+            lines.append(f"Range: {self.laser_range:.1f} m")
+
+        if self.laser_target:
+            lines.append(f"Lat: {self.laser_target['lat']:.7f}")
+            lines.append(f"Lon: {self.laser_target['lon']:.7f}")
+        else:
+            lines.append("Lat/Lon: -")
+
+        return lines
+
+    def _apply_laser_overlay(self, lines):
+        if lines:
+            self.video_stage.set_laser_overlay(lines)
+        else:
+            self.video_stage.clear_laser_overlay()
 
     def run_command(self, label: str, command: Callable):
-        if not self.client:
+        if not self._ensure_client():
             self.log_message(f"{label}: not connected")
             return
-        threading.Thread(target=self._command_worker, args=(label, command), daemon=True).start()
+
+        threading.Thread(
+            target=self._command_worker,
+            args=(label, command),
+            daemon=True,
+        ).start()
 
     def _command_worker(self, label: str, command: Callable):
         try:
@@ -762,21 +1171,34 @@ class ZT30QtDashboard(QMainWindow):
 
     def apply_camera_view(self):
         mode = CAMERA_VIEWS[self.view_combo.currentText()]
+
         if mode not in IMAGE_MODE_BY_NAME:
-            QMessageBox.warning(self, "View not available", "This camera view is not available in the SDK mapping.")
+            QMessageBox.warning(
+                self,
+                "View not available",
+                "This camera view is not available in the SDK mapping.",
+            )
             return
+
         self.run_command("camera view", lambda: self.client.set_image_mode(mode))
 
     def apply_palette(self):
         palette = THERMAL_NAMES[self.palette_combo.currentText()]
+
         if palette not in THERMAL_PALETTES.values():
-            QMessageBox.warning(self, "Palette not available", "This thermal palette is not available in the SDK mapping.")
+            QMessageBox.warning(
+                self,
+                "Palette not available",
+                "This thermal palette is not available in the SDK mapping.",
+            )
             return
+
         self.run_command("thermal palette", lambda: self.client.set_thermal_palette(palette))
 
     def refresh_status(self):
-        if not self.client:
+        if not self._ensure_client():
             return
+
         threading.Thread(target=self._refresh_worker, daemon=True).start()
 
     def _refresh_worker(self):
@@ -792,6 +1214,7 @@ class ZT30QtDashboard(QMainWindow):
             self.yaw_value[1].setText(f"{attitude['yaw_deg']:.1f}")
             self.pitch_value[1].setText(f"{attitude['pitch_deg']:.1f}")
             self.roll_value[1].setText(f"{attitude['roll_deg']:.1f}")
+
         if zoom is not None:
             self.zoom_value[1].setText(f"{zoom:.1f}x")
 
@@ -802,13 +1225,19 @@ class ZT30QtDashboard(QMainWindow):
             self.stop_joystick()
 
     def start_joystick(self):
+        if not self._ensure_client():
+            self.joystick_check.setChecked(False)
+            return
+
         self.stop_joystick()
+
         self.joystick_thread = JoystickThread(
             "/dev/input/js0",
             self.speed_slider.value,
             self.deadzone_slider.value,
             self,
         )
+
         self.joystick_thread.speed_changed.connect(self.handle_joystick_speed)
         self.joystick_thread.status_changed.connect(self.joystick_status.setText)
         self.joystick_thread.message.connect(self.log_message)
@@ -818,7 +1247,10 @@ class ZT30QtDashboard(QMainWindow):
         if self.joystick_thread:
             self.joystick_thread.stop()
             self.joystick_thread = None
-        self.joystick_status.setText("Off")
+
+        if hasattr(self, "joystick_status"):
+            self.joystick_status.setText("Off")
+
         if self.client:
             try:
                 self.client.stop_rotation()
@@ -827,10 +1259,16 @@ class ZT30QtDashboard(QMainWindow):
 
     def handle_joystick_speed(self, yaw: int, pitch: int):
         speed = (yaw, pitch)
+
         if speed == self.last_joystick_speed or not self.client:
             return
+
         self.last_joystick_speed = speed
-        threading.Thread(target=lambda: self.client.rotate_speed(yaw, pitch), daemon=True).start()
+
+        threading.Thread(
+            target=lambda: self.client.rotate_speed(yaw, pitch),
+            daemon=True,
+        ).start()
 
     def log_message(self, text: str):
         self.log_signal.emit(text)
@@ -839,13 +1277,17 @@ class ZT30QtDashboard(QMainWindow):
         if event.matches(QKeySequence.Refresh):
             self.refresh_status()
             return
+
         super().keyPressEvent(event)
 
     def closeEvent(self, event):
+        self.laser_timer.stop()
         self.stop_joystick()
         self.stop_streams()
+
         if self.client:
             self.client.close()
+
         event.accept()
 
     def _apply_style(self):
@@ -857,6 +1299,7 @@ class ZT30QtDashboard(QMainWindow):
                 font-family: Inter, Segoe UI, Arial;
                 font-size: 13px;
             }
+
             QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox {
                 background: #151b22;
                 border: 1px solid #2a3440;
@@ -866,6 +1309,7 @@ class ZT30QtDashboard(QMainWindow):
                 color: #eef3f7;
                 selection-background-color: #1f8f7a;
             }
+
             QPushButton, QToolButton {
                 background: #19212a;
                 border: 1px solid #303b47;
@@ -874,45 +1318,55 @@ class ZT30QtDashboard(QMainWindow):
                 font-weight: 600;
                 color: #edf2f7;
             }
+
             QPushButton:hover, QToolButton:hover {
                 background: #202b36;
                 border-color: #3d4d5d;
             }
+
             QPushButton:pressed, QToolButton:pressed {
                 background: #111820;
             }
+
             #chip:checked {
                 background: #1f8f7a;
                 border-color: #2db69c;
                 color: #ffffff;
             }
+
             #toolbar, #sidePanel, QGroupBox, #controlWrapper {
                 background: #151b22;
                 border: 1px solid #252f3a;
                 border-radius: 10px;
             }
+
             #controlScroll {
                 background: transparent;
                 border: 0;
             }
+
             #sidebarToggle {
                 background: #151b22;
                 border: 1px solid #2a3440;
                 color: #aeb8c4;
                 padding: 8px 10px;
             }
+
             #sidebarToggle:hover {
                 color: #ffffff;
                 border-color: #1f8f7a;
             }
+
             #toolbar {
                 max-height: 58px;
             }
+
             QGroupBox {
                 margin-top: 12px;
                 padding: 14px;
                 font-weight: 700;
             }
+
             QGroupBox::title {
                 subcontrol-origin: margin;
                 left: 12px;
@@ -920,17 +1374,20 @@ class ZT30QtDashboard(QMainWindow):
                 color: #cfd8e3;
                 background: #151b22;
             }
+
             #videoStage {
                 background: #05070a;
                 border-radius: 12px;
                 border: 1px solid #2c3744;
             }
+
             #mainVideo {
                 background: #030507;
                 color: #73808e;
                 border-radius: 12px;
                 font-size: 18px;
             }
+
             #pipVideo {
                 background: #030507;
                 color: #b5c0cb;
@@ -938,6 +1395,7 @@ class ZT30QtDashboard(QMainWindow):
                 border-radius: 8px;
                 margin: 18px;
             }
+
             #statusBadge {
                 background: #123f37;
                 color: #6ee7c8;
@@ -945,44 +1403,53 @@ class ZT30QtDashboard(QMainWindow):
                 padding: 5px 10px;
                 font-weight: 700;
             }
+
             #metricLabel {
                 color: #8f9ba8;
                 font-size: 12px;
             }
+
             #metricValue {
                 color: #f2f6fa;
                 font-size: 20px;
                 font-weight: 700;
             }
+
             #log {
                 background: #0f141a;
                 border: 1px solid #252f3a;
                 border-radius: 8px;
                 color: #b9c4cf;
             }
+
             QCheckBox {
                 color: #dce4ec;
                 spacing: 8px;
             }
+
             QScrollBar:vertical {
                 background: #10161d;
                 width: 10px;
                 margin: 0;
                 border-radius: 5px;
             }
+
             QScrollBar::handle:vertical {
                 background: #303c49;
                 min-height: 28px;
                 border-radius: 5px;
             }
+
             QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
                 height: 0;
             }
+
             QSlider::groove:horizontal {
                 height: 6px;
                 background: #293440;
                 border-radius: 3px;
             }
+
             QSlider::handle:horizontal {
                 background: #1f8f7a;
                 width: 16px;
@@ -997,8 +1464,10 @@ def main():
     app = QApplication(sys.argv)
     app.setApplicationName("ZT30 Control")
     app.setFont(QFont("Inter", 10))
+
     window = ZT30QtDashboard()
     window.show()
+
     sys.exit(app.exec_())
 
 
