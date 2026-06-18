@@ -414,11 +414,32 @@ class ZT30QtDashboard(QMainWindow):
         return column
 
     def _build_control_panel(self):
+        wrapper = QFrame()
+        wrapper.setObjectName("controlWrapper")
+        wrapper.setFixedWidth(420)
+        wrapper_layout = QVBoxLayout(wrapper)
+        wrapper_layout.setContentsMargins(0, 0, 0, 0)
+        wrapper_layout.setSpacing(8)
+
+        toggle_row = QHBoxLayout()
+        toggle_row.setContentsMargins(0, 0, 0, 0)
+        self.sidebar_toggle = QToolButton()
+        self.sidebar_toggle.setObjectName("sidebarToggle")
+        self.sidebar_toggle.setText("Controls  <")
+        self.sidebar_toggle.setCheckable(True)
+        self.sidebar_toggle.setChecked(True)
+        self.sidebar_toggle.clicked.connect(self.toggle_sidebar)
+        toggle_row.addStretch(1)
+        toggle_row.addWidget(self.sidebar_toggle)
+        wrapper_layout.addLayout(toggle_row)
+
         scroll = QScrollArea()
         scroll.setObjectName("controlScroll")
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.NoFrame)
         scroll.setFixedWidth(400)
+        self.control_scroll = scroll
+        self.control_wrapper = wrapper
 
         panel = QFrame()
         panel.setObjectName("sidePanel")
@@ -441,7 +462,14 @@ class ZT30QtDashboard(QMainWindow):
         layout.addWidget(self.log)
         layout.addStretch(1)
         scroll.setWidget(panel)
-        return scroll
+        wrapper_layout.addWidget(scroll, 1)
+        return wrapper
+
+    def toggle_sidebar(self):
+        expanded = self.sidebar_toggle.isChecked()
+        self.control_scroll.setVisible(expanded)
+        self.control_wrapper.setFixedWidth(420 if expanded else 48)
+        self.sidebar_toggle.setText("Controls  <" if expanded else ">")
 
     def _build_quick_actions(self):
         box = self._section("Quick Actions")
@@ -827,53 +855,66 @@ class ZT30QtDashboard(QMainWindow):
         QApplication.instance().setStyleSheet(
             """
             QWidget {
-                background: #f5f7fb;
-                color: #18212f;
+                background: #0f1318;
+                color: #e8edf2;
                 font-family: Inter, Segoe UI, Arial;
                 font-size: 13px;
             }
             #title {
                 font-size: 26px;
                 font-weight: 700;
-                color: #111827;
+                color: #f6f8fb;
             }
             #subtitle {
-                color: #6b7280;
+                color: #9aa6b2;
             }
             QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox {
-                background: #ffffff;
-                border: 1px solid #d8dee8;
+                background: #151b22;
+                border: 1px solid #2a3440;
                 border-radius: 6px;
                 padding: 7px 9px;
                 min-height: 20px;
+                color: #eef3f7;
+                selection-background-color: #1f8f7a;
             }
             QPushButton, QToolButton {
-                background: #ffffff;
-                border: 1px solid #d8dee8;
+                background: #19212a;
+                border: 1px solid #303b47;
                 border-radius: 7px;
                 padding: 8px 12px;
                 font-weight: 600;
+                color: #edf2f7;
             }
             QPushButton:hover, QToolButton:hover {
-                background: #eef4ff;
-                border-color: #9bb8e8;
+                background: #202b36;
+                border-color: #3d4d5d;
             }
             QPushButton:pressed, QToolButton:pressed {
-                background: #dfeaff;
+                background: #111820;
             }
             #chip:checked {
-                background: #1769e0;
-                border-color: #1769e0;
+                background: #1f8f7a;
+                border-color: #2db69c;
                 color: #ffffff;
             }
-            #toolbar, #sidePanel, QGroupBox {
-                background: #ffffff;
-                border: 1px solid #e1e7f0;
+            #toolbar, #sidePanel, QGroupBox, #controlWrapper {
+                background: #151b22;
+                border: 1px solid #252f3a;
                 border-radius: 10px;
             }
             #controlScroll {
                 background: transparent;
                 border: 0;
+            }
+            #sidebarToggle {
+                background: #151b22;
+                border: 1px solid #2a3440;
+                color: #aeb8c4;
+                padding: 8px 10px;
+            }
+            #sidebarToggle:hover {
+                color: #ffffff;
+                border-color: #1f8f7a;
             }
             #toolbar {
                 max-height: 58px;
@@ -887,55 +928,74 @@ class ZT30QtDashboard(QMainWindow):
                 subcontrol-origin: margin;
                 left: 12px;
                 padding: 0 5px;
-                color: #374151;
+                color: #cfd8e3;
+                background: #151b22;
             }
             #videoStage {
-                background: #0a0f17;
+                background: #05070a;
                 border-radius: 12px;
-                border: 1px solid #111827;
+                border: 1px solid #2c3744;
             }
             #mainVideo {
-                background: #05070b;
-                color: #7b8794;
+                background: #030507;
+                color: #73808e;
                 border-radius: 12px;
                 font-size: 18px;
             }
             #pipVideo {
-                background: #05070b;
-                color: #a7b1bf;
-                border: 2px solid #ffffff;
+                background: #030507;
+                color: #b5c0cb;
+                border: 2px solid #d6dde5;
                 border-radius: 8px;
                 margin: 18px;
             }
             #statusBadge {
-                background: #e8f7f2;
-                color: #087456;
+                background: #123f37;
+                color: #6ee7c8;
                 border-radius: 11px;
                 padding: 5px 10px;
                 font-weight: 700;
             }
             #metricLabel {
-                color: #6b7280;
+                color: #8f9ba8;
                 font-size: 12px;
             }
             #metricValue {
-                color: #111827;
+                color: #f2f6fa;
                 font-size: 20px;
                 font-weight: 700;
             }
             #log {
-                background: #f8fafc;
-                border: 1px solid #e1e7f0;
+                background: #0f141a;
+                border: 1px solid #252f3a;
                 border-radius: 8px;
-                color: #374151;
+                color: #b9c4cf;
+            }
+            QCheckBox {
+                color: #dce4ec;
+                spacing: 8px;
+            }
+            QScrollBar:vertical {
+                background: #10161d;
+                width: 10px;
+                margin: 0;
+                border-radius: 5px;
+            }
+            QScrollBar::handle:vertical {
+                background: #303c49;
+                min-height: 28px;
+                border-radius: 5px;
+            }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+                height: 0;
             }
             QSlider::groove:horizontal {
                 height: 6px;
-                background: #e5eaf2;
+                background: #293440;
                 border-radius: 3px;
             }
             QSlider::handle:horizontal {
-                background: #1769e0;
+                background: #1f8f7a;
                 width: 16px;
                 margin: -5px 0;
                 border-radius: 8px;

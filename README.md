@@ -69,6 +69,7 @@ The included PyQt5 dashboard provides:
 - Large main live view focused on the video stream
 - Switchable Video 1 / Video 2 live stream
 - Optional picture-in-picture view between Video 1 and Video 2
+- Collapsible right control panel
 - Gimbal pan and tilt movement buttons
 - Joystick pan and tilt control through `/dev/input/js0`
 - Center command
