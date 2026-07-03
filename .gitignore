@@ -21,4 +21,6 @@ build-*/
 appimagetool-*.AppImage
 run_dashboard.sh
 
+build-appimage/
+
 .DS_Store

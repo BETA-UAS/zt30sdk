@@ -29,7 +29,6 @@ from PyQt5.QtWidgets import (
     QFileDialog,
     QFrame,
     QGridLayout,
-    QGroupBox,
     QHBoxLayout,
     QHeaderView,
     QLabel,
@@ -634,6 +633,44 @@ class VideoStage(QFrame):
         self._selection_end = None
         self.set_ai_tracking_box(None)
         self.cancel_requested.emit()
+
+
+class CollapsibleSection(QFrame):
+    def __init__(self, title: str, expanded: bool = True, parent=None):
+        super().__init__(parent)
+        self.setObjectName("collapsibleSection")
+
+        self.header = QToolButton()
+        self.header.setObjectName("sectionHeader")
+        self.header.setText(title)
+        self.header.setCheckable(True)
+        self.header.setChecked(expanded)
+        self.header.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self.header.setArrowType(Qt.DownArrow if expanded else Qt.RightArrow)
+        self.header.clicked.connect(self.set_expanded)
+
+        self.body = QFrame()
+        self.body.setObjectName("sectionBody")
+        self.body.setVisible(expanded)
+
+        self._body_layout = QVBoxLayout(self.body)
+        self._body_layout.setContentsMargins(14, 10, 14, 14)
+        self._body_layout.setSpacing(10)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        layout.addWidget(self.header)
+        layout.addWidget(self.body)
+
+    def set_expanded(self, expanded: bool):
+        self.header.setChecked(expanded)
+        self.header.setArrowType(Qt.DownArrow if expanded else Qt.RightArrow)
+        self.body.setVisible(expanded)
+
+    def layout(self):
+        return self._body_layout
+
 
 class ZT30QtDashboard(QMainWindow):
     log_signal = pyqtSignal(str)
@@ -1251,10 +1288,7 @@ class ZT30QtDashboard(QMainWindow):
         return box
 
     def _section(self, title: str):
-        box = QGroupBox(title)
-        layout = QVBoxLayout(box)
-        layout.setSpacing(10)
-        return box
+        return CollapsibleSection(title, expanded=False)
 
     def _metric(self, name: str):
         label = QLabel(name)
@@ -2019,7 +2053,7 @@ class ZT30QtDashboard(QMainWindow):
             QFrame#toolbar,
             QFrame#sidePanel,
             QFrame#controlWrapper,
-            QGroupBox {
+            QFrame#collapsibleSection {
                 background: rgba(6, 10, 11, 188);
                 border: 1px solid rgba(93, 129, 130, 118);
                 border-radius: 8px;
@@ -2033,19 +2067,30 @@ class ZT30QtDashboard(QMainWindow):
                 background: rgba(5, 9, 10, 205);
             }
 
-            QGroupBox {
-                margin-top: 12px;
-                padding: 14px;
+            QFrame#collapsibleSection {
                 font-weight: 900;
             }
 
-            QGroupBox::title {
-                subcontrol-origin: margin;
-                left: 12px;
-                padding: 0 7px;
+            QFrame#sectionBody {
+                border: none;
+                background: transparent;
+                border-top: 1px solid rgba(93, 129, 130, 70);
+                border-radius: 0px;
+            }
+
+            QToolButton#sectionHeader {
                 color: #f2f2ef;
-                background: rgba(6, 10, 11, 225);
+                background: rgba(7, 12, 13, 190);
+                border: none;
+                border-radius: 8px;
+                padding: 10px 12px;
                 font-weight: 900;
+                text-align: left;
+            }
+
+            QToolButton#sectionHeader:hover {
+                background: rgba(13, 25, 26, 220);
+                border: none;
             }
 
             QLineEdit,
