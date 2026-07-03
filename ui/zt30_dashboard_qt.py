@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 import shutil
 import struct
@@ -10,21 +11,27 @@ import subprocess
 import sys
 import threading
 import time
+import webbrowser
 from pathlib import Path
 from typing import Callable, Optional
+from urllib.parse import urlparse
+from urllib.request import urlopen
 
-from PyQt5.QtCore import QLibraryInfo, QPoint, QRect, QSize, QThread, QTimer, Qt, pyqtSignal
-from PyQt5.QtGui import QColor, QFont, QImage, QKeySequence, QPainter, QPen, QPixmap
+from PyQt5.QtCore import QLibraryInfo, QPoint, QPointF, QRect, QSize, QThread, QTimer, Qt, pyqtSignal
+from PyQt5.QtGui import QColor, QFont, QImage, QKeySequence, QLinearGradient, QPainter, QPen, QPixmap
 from PyQt5.QtWidgets import (
     QApplication,
+    QAbstractItemView,
     QButtonGroup,
     QCheckBox,
     QComboBox,
     QDoubleSpinBox,
+    QFileDialog,
     QFrame,
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
+    QHeaderView,
     QLabel,
     QLineEdit,
     QMainWindow,
@@ -34,6 +41,8 @@ from PyQt5.QtWidgets import (
     QSizePolicy,
     QSlider,
     QSpinBox,
+    QTableWidget,
+    QTableWidgetItem,
     QTextEdit,
     QToolButton,
     QVBoxLayout,
@@ -46,12 +55,13 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from siyi_zt30 import DEFAULT_IP, DEFAULT_PORT, ZT30UDPClient
+from siyi_zt30 import AITrackingBox, DEFAULT_AI_IP, DEFAULT_IP, DEFAULT_PORT, SiyiAITrackingClient, ZT30UDPClient, ZT30WebClient
 from siyi_zt30.constants import IMAGE_MODE_BY_NAME, IMAGE_MODES, THERMAL_PALETTES
 
 
 STREAM_SIZE = (960, 540)
 PIP_SIZE_DEFAULT = (320, 180)
+AI_COORD_SIZE = (1280, 720)
 
 CAMERA_VIEWS = {
     "Zoom + Thermal": "single_zoom_sub_thermal",
@@ -81,8 +91,50 @@ def rtsp_url(host: str, stream: int) -> str:
     return f"rtsp://{host}:8554/video{stream}"
 
 
+def ai_rtsp_url(host: str) -> str:
+    return f"rtsp://{host}:554/video0"
+
+
 def clamp(value: int, min_value: int, max_value: int) -> int:
     return max(min_value, min(max_value, int(value)))
+
+
+class CockpitBackground(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._phase = 0
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._tick)
+        self._timer.start(55)
+
+    def _tick(self):
+        self._phase = (self._phase + 1) % 720
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        rect = self.rect()
+        painter.fillRect(rect, QColor("#000000"))
+
+        wash = QLinearGradient(QPointF(0, rect.height()), QPointF(rect.width(), 0))
+        wash.setColorAt(0.0, QColor(0, 176, 190, 88))
+        wash.setColorAt(0.26, QColor(0, 54, 65, 66))
+        wash.setColorAt(0.58, QColor(2, 12, 15, 118))
+        wash.setColorAt(1.0, QColor(0, 0, 0, 255))
+        painter.fillRect(rect, wash)
+
+        sweep = QLinearGradient(QPointF(rect.width() * 0.2, 0), QPointF(rect.width(), rect.height()))
+        sweep.setColorAt(0.0, QColor(0, 238, 255, 28))
+        sweep.setColorAt(0.45, QColor(0, 120, 140, 18))
+        sweep.setColorAt(1.0, QColor(0, 0, 0, 0))
+        painter.fillRect(rect, sweep)
+
+        horizon = QPen(QColor(255, 255, 255, 18), 1)
+        painter.setPen(horizon)
+        y = int(rect.height() * (0.52 + 0.015 * math.sin(self._phase / 40.0)))
+        painter.drawLine(0, y, rect.width(), y)
+        painter.end()
 
 
 class FFmpegStreamThread(QThread):
@@ -90,11 +142,12 @@ class FFmpegStreamThread(QThread):
     status_changed = pyqtSignal(str)
     error = pyqtSignal(str)
 
-    def __init__(self, url: str, width: int, height: int, parent=None):
+    def __init__(self, url: str, width: int, height: int, transport: str = "tcp", parent=None):
         super().__init__(parent)
         self.url = url
         self.width = width
         self.height = height
+        self.transport = transport
         self._running = False
         self._process: Optional[subprocess.Popen] = None
 
@@ -115,7 +168,7 @@ class FFmpegStreamThread(QThread):
             "-loglevel",
             "warning",
             "-rtsp_transport",
-            "tcp",
+            self.transport,
             "-fflags",
             "nobuffer",
             "-flags",
@@ -290,6 +343,11 @@ class JoystickThread(QThread):
 
 class ClickableVideoLabel(QLabel):
     clicked = pyqtSignal()
+    clicked_at = pyqtSignal(QPoint)
+    pressed_at = pyqtSignal(QPoint)
+    moved_at = pyqtSignal(QPoint)
+    released_at = pyqtSignal(QPoint)
+    right_clicked = pyqtSignal()
 
     def __init__(self, text: str = ""):
         super().__init__(text)
@@ -299,9 +357,29 @@ class ClickableVideoLabel(QLabel):
         self._last_pixmap = pixmap
         super().setPixmap(pixmap)
 
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self.pressed_at.emit(event.pos())
+            return
+
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if event.buttons() & Qt.LeftButton:
+            self.moved_at.emit(event.pos())
+            return
+
+        super().mouseMoveEvent(event)
+
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.LeftButton:
             self.clicked.emit()
+            self.clicked_at.emit(event.pos())
+            self.released_at.emit(event.pos())
+            return
+
+        if event.button() == Qt.RightButton:
+            self.right_clicked.emit()
             return
 
         super().mouseReleaseEvent(event)
@@ -309,6 +387,9 @@ class ClickableVideoLabel(QLabel):
 
 class VideoStage(QFrame):
     pip_clicked = pyqtSignal()
+    main_clicked = pyqtSignal(int, int)
+    main_box_selected = pyqtSignal(int, int, int, int)
+    cancel_requested = pyqtSignal()
 
     def __init__(self):
         super().__init__()
@@ -320,6 +401,10 @@ class VideoStage(QFrame):
         self.main_label.setObjectName("mainVideo")
         self.main_label.setAlignment(Qt.AlignCenter)
         self.main_label.setScaledContents(False)
+        self.main_label.pressed_at.connect(self._handle_main_press)
+        self.main_label.moved_at.connect(self._handle_main_move)
+        self.main_label.released_at.connect(self._handle_main_release)
+        self.main_label.right_clicked.connect(self._handle_cancel_requested)
 
         self.pip_label = ClickableVideoLabel("PiP")
         self.pip_label.setObjectName("pipVideo")
@@ -336,6 +421,9 @@ class VideoStage(QFrame):
         self._main_pixmap: Optional[QPixmap] = None
         self._pip_pixmap: Optional[QPixmap] = None
         self._laser_overlay_lines = []
+        self._ai_tracking_box: Optional[AITrackingBox] = None
+        self._selection_start: Optional[tuple[int, int]] = None
+        self._selection_end: Optional[tuple[int, int]] = None
 
     def set_main_frame(self, image: QImage):
         self._main_pixmap = QPixmap.fromImage(image)
@@ -369,6 +457,10 @@ class VideoStage(QFrame):
 
     def clear_laser_overlay(self):
         self._laser_overlay_lines = []
+        self._refresh_pixmaps()
+
+    def set_ai_tracking_box(self, box: Optional[AITrackingBox]):
+        self._ai_tracking_box = box
         self._refresh_pixmaps()
 
     def resizeEvent(self, event):
@@ -438,12 +530,118 @@ class VideoStage(QFrame):
                 painter.drawText(rect.x() + 11, y, line)
                 y += line_height
 
+        if self._selection_start and self._selection_end:
+            self._draw_selection_box(painter, pixmap)
+
         painter.end()
+
+    def _draw_ai_tracking_box(self, painter: QPainter, pixmap: QPixmap, box: AITrackingBox):
+        scale_x = pixmap.width() / AI_COORD_SIZE[0]
+        scale_y = pixmap.height() / AI_COORD_SIZE[1]
+
+        left = clamp(round(box.left * scale_x), 0, pixmap.width() - 1)
+        top = clamp(round(box.top * scale_y), 0, pixmap.height() - 1)
+        right = clamp(round(box.right * scale_x), 0, pixmap.width() - 1)
+        bottom = clamp(round(box.bottom * scale_y), 0, pixmap.height() - 1)
+
+        rect = QRect(left, top, max(2, right - left), max(2, bottom - top))
+        painter.setPen(QPen(QColor(0, 0, 0, 210), 5))
+        painter.drawRect(rect)
+        color = QColor("#2fd16d") if box.track_state in (0, 4) else QColor("#f7d84a")
+        painter.setPen(QPen(color, 3))
+        painter.drawRect(rect)
+
+    def _draw_selection_box(self, painter: QPainter, pixmap: QPixmap):
+        left, top, right, bottom = self._normalized_selection()
+        scale_x = pixmap.width() / AI_COORD_SIZE[0]
+        scale_y = pixmap.height() / AI_COORD_SIZE[1]
+        rect = QRect(
+            clamp(round(left * scale_x), 0, pixmap.width() - 1),
+            clamp(round(top * scale_y), 0, pixmap.height() - 1),
+            max(2, round((right - left) * scale_x)),
+            max(2, round((bottom - top) * scale_y)),
+        )
+        painter.setPen(QPen(QColor(0, 0, 0, 220), 5))
+        painter.drawRect(rect)
+        painter.setPen(QPen(QColor("#42a5ff"), 2))
+        painter.drawRect(rect)
+
+    def _normalized_selection(self):
+        sx, sy = self._selection_start or (0, 0)
+        ex, ey = self._selection_end or (sx, sy)
+        return min(sx, ex), min(sy, ey), max(sx, ex), max(sy, ey)
+
+    def _video_pos_to_ai(self, pos: QPoint) -> Optional[tuple[int, int]]:
+        if self._main_pixmap is None or self._main_pixmap.isNull():
+            return None
+
+        label_size = self.main_label.size()
+        source_size = self._main_pixmap.size()
+        scale = min(
+            label_size.width() / max(1, source_size.width()),
+            label_size.height() / max(1, source_size.height()),
+        )
+        displayed_width = round(source_size.width() * scale)
+        displayed_height = round(source_size.height() * scale)
+        x_offset = max(0, (label_size.width() - displayed_width) // 2)
+        y_offset = max(0, (label_size.height() - displayed_height) // 2)
+        x = pos.x() - x_offset
+        y = pos.y() - y_offset
+
+        if x < 0 or y < 0 or x >= displayed_width or y >= displayed_height:
+            return None
+
+        ai_x = clamp(round(x * (AI_COORD_SIZE[0] - 1) / max(1, displayed_width - 1)), 0, AI_COORD_SIZE[0] - 1)
+        ai_y = clamp(round(y * (AI_COORD_SIZE[1] - 1) / max(1, displayed_height - 1)), 0, AI_COORD_SIZE[1] - 1)
+        return ai_x, ai_y
+
+    def _handle_main_press(self, pos: QPoint):
+        ai_pos = self._video_pos_to_ai(pos)
+        if not ai_pos:
+            return
+        self._selection_start = ai_pos
+        self._selection_end = ai_pos
+
+    def _handle_main_move(self, pos: QPoint):
+        if not self._selection_start:
+            return
+        ai_pos = self._video_pos_to_ai(pos)
+        if not ai_pos:
+            return
+        self._selection_end = ai_pos
+        self._refresh_pixmaps()
+
+    def _handle_main_release(self, pos: QPoint):
+        if not self._selection_start:
+            return
+        ai_pos = self._video_pos_to_ai(pos)
+        if ai_pos:
+            self._selection_end = ai_pos
+
+        left, top, right, bottom = self._normalized_selection()
+        self._selection_start = None
+        self._selection_end = None
+        self._refresh_pixmaps()
+
+        if right - left >= 24 and bottom - top >= 24:
+            self.main_box_selected.emit(left, top, right, bottom)
+        else:
+            x, y = ai_pos or (left, top)
+            self.main_clicked.emit(x, y)
+
+    def _handle_cancel_requested(self):
+        self._selection_start = None
+        self._selection_end = None
+        self.set_ai_tracking_box(None)
+        self.cancel_requested.emit()
 
 class ZT30QtDashboard(QMainWindow):
     log_signal = pyqtSignal(str)
     telemetry_signal = pyqtSignal(object, object)
     laser_overlay_signal = pyqtSignal(object)
+    ai_tracking_signal = pyqtSignal(object)
+    ai_status_signal = pyqtSignal(str)
+    media_list_signal = pyqtSignal(object, object)
 
     def __init__(self):
         super().__init__()
@@ -451,16 +649,27 @@ class ZT30QtDashboard(QMainWindow):
         self.resize(1440, 900)
 
         self.client: Optional[ZT30UDPClient] = None
+        self.ai_client: Optional[SiyiAITrackingClient] = None
+        self.web_client: Optional[ZT30WebClient] = None
         self.connected_host = ""
         self.connected_port = 0
+        self.connected_ai_host = ""
+        self.connected_ai_port = 0
 
         self.main_thread: Optional[FFmpegStreamThread] = None
         self.pip_thread: Optional[FFmpegStreamThread] = None
+        self.primary_frame: Optional[QImage] = None
+        self.video2_frame: Optional[QImage] = None
+        self.primary_on_main = True
         self.joystick_thread: Optional[JoystickThread] = None
         self.last_joystick_speed = (None, None)
         self.laser_enabled = False
         self.laser_range: Optional[float] = None
         self.laser_target = None
+        self.last_selected_ai_box: Optional[AITrackingBox] = None
+        self.current_media_type = 0
+        self.media_items = []
+        self._updating_sources = False
 
         self._build_ui()
         self._apply_style()
@@ -468,6 +677,9 @@ class ZT30QtDashboard(QMainWindow):
         self.log_signal.connect(self.log.append)
         self.telemetry_signal.connect(self._apply_telemetry)
         self.laser_overlay_signal.connect(self._apply_laser_overlay)
+        self.ai_tracking_signal.connect(self._apply_ai_tracking_box)
+        self.ai_status_signal.connect(self._apply_ai_status)
+        self.media_list_signal.connect(self._apply_media_list)
 
         self._ensure_client()
 
@@ -480,7 +692,7 @@ class ZT30QtDashboard(QMainWindow):
         self.laser_timer.start(2500)
 
     def _build_ui(self):
-        root = QWidget()
+        root = CockpitBackground()
         self.setCentralWidget(root)
 
         shell = QVBoxLayout(root)
@@ -504,22 +716,21 @@ class ZT30QtDashboard(QMainWindow):
         tools.setContentsMargins(12, 10, 12, 10)
         tools.setSpacing(10)
 
-        self.stream_group = QButtonGroup(self)
-
-        self.video1_btn = self._chip("Video 1", True)
-        self.video2_btn = self._chip("Video 2", False)
-
-        self.stream_group.addButton(self.video1_btn, 1)
-        self.stream_group.addButton(self.video2_btn, 2)
-
-        tools.addWidget(QLabel("Live view"))
-        tools.addWidget(self.video1_btn)
-        tools.addWidget(self.video2_btn)
+        tools.addWidget(QLabel("Main"))
+        self.main_source_combo = QComboBox()
+        self.main_source_combo.addItems(["AI Camera", "Video 1"])
+        self.main_source_combo.setCurrentText("AI Camera")
+        self.main_source_combo.currentIndexChanged.connect(self.handle_source_change)
+        tools.addWidget(self.main_source_combo)
 
         self.pip_check = QCheckBox("Picture in Picture")
         self.pip_check.setChecked(True)
         self.pip_check.toggled.connect(self.handle_pip_toggle)
         tools.addWidget(self.pip_check)
+
+        self.pip_source_label = QLabel("PiP: Video 2")
+        self.pip_source_label.setObjectName("statusBadge")
+        tools.addWidget(self.pip_source_label)
 
         tools.addWidget(QLabel("PiP Size"))
         self.pip_size_slider = QSlider(Qt.Horizontal)
@@ -546,6 +757,9 @@ class ZT30QtDashboard(QMainWindow):
 
         self.video_stage = VideoStage()
         self.video_stage.pip_clicked.connect(self.swap_pip_view)
+        self.video_stage.main_clicked.connect(self.track_clicked_point)
+        self.video_stage.main_box_selected.connect(self.track_ai_box)
+        self.video_stage.cancel_requested.connect(self.cancel_ai_tracking)
 
         column.addWidget(toolbar)
         column.addWidget(self.video_stage, 1)
@@ -596,6 +810,8 @@ class ZT30QtDashboard(QMainWindow):
         layout.addWidget(self._build_quick_actions())
         layout.addWidget(self._build_gimbal_controls())
         layout.addWidget(self._build_camera_controls())
+        layout.addWidget(self._build_media_controls())
+        layout.addWidget(self._build_ai_controls())
         layout.addWidget(self._build_laser_controls())
         layout.addWidget(self._build_joystick_controls())
         layout.addWidget(self._build_status_cards())
@@ -868,6 +1084,117 @@ class ZT30QtDashboard(QMainWindow):
         box.layout().addLayout(row)
         return box
 
+    def _build_media_controls(self):
+        box = self._section("Media")
+
+        row = QHBoxLayout()
+
+        photos = QPushButton("Photos")
+        photos.clicked.connect(lambda: self.load_media(0))
+
+        videos = QPushButton("Videos")
+        videos.clicked.connect(lambda: self.load_media(1))
+
+        refresh = QPushButton("Refresh")
+        refresh.clicked.connect(lambda: self.load_media(self.current_media_type))
+
+        row.addWidget(photos)
+        row.addWidget(videos)
+        row.addWidget(refresh)
+        box.layout().addLayout(row)
+
+        self.media_table = QTableWidget(0, 2)
+        self.media_table.setHorizontalHeaderLabels(["Name", "URL"])
+        self.media_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.media_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.media_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.media_table.verticalHeader().setVisible(False)
+        self.media_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        self.media_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        self.media_table.setFixedHeight(150)
+        self.media_table.doubleClicked.connect(lambda _index: self.open_selected_media())
+        box.layout().addWidget(self.media_table)
+
+        action_row = QHBoxLayout()
+
+        open_btn = QPushButton("Open")
+        open_btn.clicked.connect(self.open_selected_media)
+
+        download_btn = QPushButton("Download")
+        download_btn.clicked.connect(self.download_selected_media)
+
+        action_row.addWidget(open_btn)
+        action_row.addWidget(download_btn)
+        box.layout().addLayout(action_row)
+
+        self.media_status_label = QLabel("Media: ready")
+        self.media_status_label.setObjectName("metricLabel")
+        box.layout().addWidget(self.media_status_label)
+
+        return box
+
+    def _build_ai_controls(self):
+        box = self._section("AI Tracking")
+        grid = QGridLayout()
+
+        self.ai_host_edit = QLineEdit(DEFAULT_AI_IP)
+        self.ai_host_edit.setMinimumWidth(180)
+
+        self.ai_port_spin = QSpinBox()
+        self.ai_port_spin.setRange(1, 65535)
+        self.ai_port_spin.setValue(DEFAULT_PORT)
+        self.ai_port_spin.setMinimumWidth(100)
+
+        ai_connect = QPushButton("Connect AI")
+        ai_connect.clicked.connect(lambda: self._ensure_ai_client(force=True))
+
+        grid.addWidget(QLabel("AI IP"), 0, 0)
+        grid.addWidget(self.ai_host_edit, 0, 1, 1, 2)
+        grid.addWidget(QLabel("Port"), 1, 0)
+        grid.addWidget(self.ai_port_spin, 1, 1)
+        grid.addWidget(ai_connect, 1, 2)
+
+        box.layout().addLayout(grid)
+
+        row = QHBoxLayout()
+
+        ai_on = QPushButton("Rec On")
+        ai_on.clicked.connect(lambda: self.set_ai_recognition(True))
+
+        ai_off = QPushButton("Rec Off")
+        ai_off.clicked.connect(lambda: self.set_ai_recognition(False))
+
+        ai_status = QPushButton("Status")
+        ai_status.clicked.connect(self.refresh_ai_status)
+
+        row.addWidget(ai_on)
+        row.addWidget(ai_off)
+        row.addWidget(ai_status)
+        box.layout().addLayout(row)
+
+        track_row = QHBoxLayout()
+
+        center = QPushButton("Track Center")
+        center.clicked.connect(lambda: self.track_ai_point(AI_COORD_SIZE[0] // 2, AI_COORD_SIZE[1] // 2))
+
+        cancel = QPushButton("Cancel")
+        cancel.clicked.connect(self.cancel_ai_tracking)
+
+        self.ai_overlay_check = QCheckBox("Overlay")
+        self.ai_overlay_check.setChecked(True)
+        self.ai_overlay_check.toggled.connect(self.toggle_ai_overlay)
+
+        track_row.addWidget(center)
+        track_row.addWidget(cancel)
+        track_row.addWidget(self.ai_overlay_check)
+        box.layout().addLayout(track_row)
+
+        self.ai_status_label = QLabel("AI: idle")
+        self.ai_status_label.setObjectName("metricLabel")
+        box.layout().addWidget(self.ai_status_label)
+
+        return box
+
     def _build_joystick_controls(self):
         box = self._section("Joystick")
 
@@ -990,40 +1317,125 @@ class ZT30QtDashboard(QMainWindow):
             self.log_message(f"UDP connect error: {exc}")
             return False
 
-    def start_streams(self):
-        if not self._ensure_client():
-            return
+    def _ensure_web_client(self, force: bool = False):
+        host = self.host_edit.text().strip()
+        base_url = f"http://{host}:82//cgi-bin/media.cgi"
 
+        if not force and self.web_client and getattr(self.web_client, "base_url", "") == base_url.rstrip("/"):
+            return True
+
+        try:
+            self.web_client = ZT30WebClient(base_url, timeout=5.0)
+            return True
+        except Exception as exc:
+            self.web_client = None
+            self.log_message(f"media client: ERROR {exc}")
+            return False
+
+    def _ensure_ai_client(self, force: bool = False):
+        host = self.ai_host_edit.text().strip()
+        port = self.ai_port_spin.value()
+
+        if not force and self.ai_client and self.connected_ai_host == host and self.connected_ai_port == port:
+            return True
+
+        if self.ai_client:
+            try:
+                self.ai_client.close()
+            except Exception:
+                pass
+
+        try:
+            self.ai_client = SiyiAITrackingClient(host, port)
+            self.connected_ai_host = host
+            self.connected_ai_port = port
+            self.log_message(f"AI UDP ready: {host}:{port}")
+            return True
+
+        except Exception as exc:
+            self.ai_client = None
+            self.log_message(f"AI UDP connect error: {exc}")
+            return False
+
+    def start_streams(self):
         self.stop_streams()
 
-        stream = self.stream_group.checkedId() or 1
-        other = 2 if stream == 1 else 1
-        host = self.host_edit.text().strip()
+        try:
+            primary_source = self._source_spec(self.main_source_combo.currentText())
+            video2_source = self._source_spec("Video 2")
+        except Exception as exc:
+            self.log_message(f"video source: ERROR {exc}")
+            return
+
+        self.primary_frame = None
+        self.video2_frame = None
+        self.primary_on_main = True
 
         self.main_thread = self._start_stream(
-            rtsp_url(host, stream),
+            primary_source["url"],
             *STREAM_SIZE,
-            self.video_stage.set_main_frame,
+            lambda image: self._handle_source_frame("primary", image),
+            transport=primary_source["transport"],
         )
 
-        if self.pip_check.isChecked():
-            self.video_stage.set_pip_enabled(True)
-            self.pip_thread = self._start_stream(
-                rtsp_url(host, other),
-                *PIP_SIZE_DEFAULT,
-                self.video_stage.set_pip_frame,
-            )
-        else:
-            self.video_stage.set_pip_enabled(False)
+        self.pip_thread = self._start_stream(
+            video2_source["url"],
+            *STREAM_SIZE,
+            lambda image: self._handle_source_frame("video2", image),
+            transport=video2_source["transport"],
+        )
 
-    def _start_stream(self, url: str, width: int, height: int, frame_slot):
-        thread = FFmpegStreamThread(url, width, height, self)
+        self._render_video_layout()
+
+    def _source_spec(self, name: str):
+        name = name.strip()
+        camera_host = self.host_edit.text().strip()
+
+        if name == "AI Camera":
+            if not self._ensure_ai_client():
+                raise RuntimeError("AI client not ready")
+            self._set_ai_rtsp_enabled(True)
+            return {
+                "name": name,
+                "url": ai_rtsp_url(self.ai_host_edit.text().strip()),
+                "transport": "udp",
+            }
+
+        if name == "Video 1":
+            return {"name": name, "url": rtsp_url(camera_host, 1), "transport": "tcp"}
+
+        if name == "Video 2":
+            return {"name": name, "url": rtsp_url(camera_host, 2), "transport": "tcp"}
+
+        raise ValueError(f"unknown source {name!r}")
+
+    def _start_stream(self, url: str, width: int, height: int, frame_slot, transport: str = "tcp"):
+        thread = FFmpegStreamThread(url, width, height, transport, self)
         thread.frame_ready.connect(frame_slot)
         thread.status_changed.connect(self.status_badge.setText)
         thread.error.connect(lambda text: self.log_message(f"stream error: {text}"))
         thread.start()
         self.log_message(f"Playing {url}")
         return thread
+
+    def _handle_source_frame(self, source: str, image: QImage):
+        if source == "primary":
+            self.primary_frame = image
+        elif source == "video2":
+            self.video2_frame = image
+        self._render_video_layout()
+
+    def _render_video_layout(self):
+        main_frame = self.primary_frame if self.primary_on_main else self.video2_frame
+        pip_frame = self.video2_frame if self.primary_on_main else self.primary_frame
+
+        if main_frame is not None:
+            self.video_stage.set_main_frame(main_frame)
+
+        pip_enabled = self.pip_check.isChecked() and pip_frame is not None
+        self.video_stage.set_pip_enabled(pip_enabled)
+        if pip_enabled:
+            self.video_stage.set_pip_frame(pip_frame)
 
     def stop_streams(self):
         if self.main_thread:
@@ -1036,10 +1448,28 @@ class ZT30QtDashboard(QMainWindow):
 
         self.status_badge.setText("Idle")
         self.video_stage.clear_main("Select Connect + Play to start the stream")
+        self.video_stage.set_pip_enabled(False)
+        self.primary_frame = None
+        self.video2_frame = None
+
+        if self.ai_client:
+            self._set_ai_rtsp_enabled(False)
+
+    def _set_ai_rtsp_enabled(self, enabled: bool):
+        try:
+            result = self.ai_client.set_rtsp_stream_enabled(enabled)
+            self.log_message(f"AI RTSP {'on' if enabled else 'off'}: {result}")
+            return result
+        except Exception as exc:
+            self.log_message(f"AI RTSP {'on' if enabled else 'off'}: ERROR {exc}")
+            return None
 
     def handle_pip_toggle(self, enabled: bool):
-        self.video_stage.set_pip_enabled(enabled)
+        self._render_video_layout()
 
+    def handle_source_change(self):
+        if self._updating_sources:
+            return
         if self.main_thread:
             self.start_streams()
 
@@ -1047,18 +1477,10 @@ class ZT30QtDashboard(QMainWindow):
         if not self.pip_check.isChecked():
             return
 
-        current = self.stream_group.checkedId() or 1
-        new_main = 2 if current == 1 else 1
-
-        if new_main == 1:
-            self.video1_btn.setChecked(True)
-        else:
-            self.video2_btn.setChecked(True)
-
-        self.log_message(f"PiP clicked: switched main view to Video {new_main}")
-
-        if self.main_thread:
-            self.start_streams()
+        self.primary_on_main = not self.primary_on_main
+        self._render_video_layout()
+        main_name = self.main_source_combo.currentText() if self.primary_on_main else "Video 2"
+        self.log_message(f"PiP clicked: main view is now {main_name}")
 
     def set_laser_enabled(self, enabled: bool):
         if not self._ensure_client():
@@ -1126,6 +1548,293 @@ class ZT30QtDashboard(QMainWindow):
             self.video_stage.set_laser_overlay(lines)
         else:
             self.video_stage.clear_laser_overlay()
+
+    def load_media(self, media_type: int):
+        if not self._ensure_web_client(force=True):
+            return
+
+        self.current_media_type = int(media_type)
+        label = "photos" if media_type == 0 else "videos"
+        self.media_status_label.setText(f"Media: loading {label}...")
+
+        threading.Thread(
+            target=self._load_media_worker,
+            args=(int(media_type),),
+            daemon=True,
+        ).start()
+
+    def _load_media_worker(self, media_type: int):
+        try:
+            dirs = self.web_client.get_directories(media_type)
+            if not dirs.get("success"):
+                self.media_list_signal.emit([], f"Media: {dirs.get('message', 'directory error')}")
+                return
+
+            directories = (dirs.get("data") or {}).get("directories") or []
+            if not directories:
+                self.media_list_signal.emit([], "Media: no directory found")
+                return
+
+            path = directories[0].get("path", "")
+            count_data = self.web_client.get_media_count(media_type, path)
+            total = ((count_data.get("data") or {}).get("count") if count_data.get("success") else "?")
+            listing = self.web_client.get_media_list(media_type, path, 0, 200)
+
+            if not listing.get("success"):
+                self.media_list_signal.emit([], f"Media: {listing.get('message', 'list error')}")
+                return
+
+            items = (listing.get("data") or {}).get("list") or []
+            status = f"Media: {path} | {len(items)}/{total}"
+            self.media_list_signal.emit(items, status)
+        except Exception as exc:
+            self.media_list_signal.emit([], f"Media: ERROR {exc}")
+
+    def _apply_media_list(self, items, status):
+        self.media_items = list(items or [])
+        self.media_table.setRowCount(len(self.media_items))
+
+        for row, item in enumerate(self.media_items):
+            name = item.get("name", "Unnamed")
+            url = item.get("url", "")
+            name_item = QTableWidgetItem(name)
+            name_item.setData(Qt.UserRole, item)
+            url_item = QTableWidgetItem(url)
+            url_item.setData(Qt.UserRole, item)
+            self.media_table.setItem(row, 0, name_item)
+            self.media_table.setItem(row, 1, url_item)
+
+        self.media_status_label.setText(str(status))
+
+    def _selected_media_item(self):
+        rows = self.media_table.selectionModel().selectedRows() if hasattr(self, "media_table") else []
+        if not rows:
+            return None
+        row = rows[0].row()
+        if row < 0 or row >= len(self.media_items):
+            return None
+        return self.media_items[row]
+
+    def open_selected_media(self):
+        item = self._selected_media_item()
+        if not item:
+            self.media_status_label.setText("Media: select a file")
+            return
+
+        url = item.get("url")
+        if not self._is_allowed_media_url(url):
+            self.media_status_label.setText("Media: invalid URL")
+            return
+
+        webbrowser.open(url)
+        self.media_status_label.setText(f"Media: opened {item.get('name', 'file')}")
+
+    def download_selected_media(self):
+        item = self._selected_media_item()
+        if not item:
+            self.media_status_label.setText("Media: select a file")
+            return
+
+        url = item.get("url")
+        if not self._is_allowed_media_url(url):
+            self.media_status_label.setText("Media: invalid URL")
+            return
+
+        default_name = item.get("name") or Path(urlparse(url).path).name or "zt30_media"
+        target, _ = QFileDialog.getSaveFileName(self, "Download Media", str(Path.home() / "Downloads" / default_name))
+        if not target:
+            return
+
+        self.media_status_label.setText(f"Media: downloading {default_name}...")
+        threading.Thread(
+            target=self._download_media_worker,
+            args=(url, target),
+            daemon=True,
+        ).start()
+
+    def _download_media_worker(self, url: str, target: str):
+        try:
+            with urlopen(url, timeout=20) as response, open(target, "wb") as output:
+                shutil.copyfileobj(response, output, length=1024 * 256)
+            self.log_message(f"media download: {target}")
+            self.media_list_signal.emit(self.media_items, f"Media: downloaded {Path(target).name}")
+        except Exception as exc:
+            self.media_list_signal.emit(self.media_items, f"Media: download ERROR {exc}")
+
+    def _is_allowed_media_url(self, url: Optional[str]) -> bool:
+        if not url:
+            return False
+        try:
+            parsed = urlparse(url)
+        except Exception:
+            return False
+        return parsed.scheme in ("http", "https") and parsed.hostname == self.host_edit.text().strip()
+
+    def run_ai_command(self, label: str, command: Callable):
+        if not self._ensure_ai_client():
+            self.log_message(f"{label}: AI not connected")
+            return
+
+        threading.Thread(
+            target=self._ai_command_worker,
+            args=(label, command),
+            daemon=True,
+        ).start()
+
+    def _ai_command_worker(self, label: str, command: Callable):
+        try:
+            result = command()
+            self.log_message(f"{label}: {result if result is not None else 'OK'}")
+        except Exception as exc:
+            self.log_message(f"{label}: ERROR {exc}")
+
+    def set_ai_recognition(self, enabled: bool):
+        self.run_ai_command(
+            "AI recognition on" if enabled else "AI recognition off",
+            lambda: self._set_ai_recognition_worker(enabled),
+        )
+
+    def _set_ai_recognition_worker(self, enabled: bool):
+        result = self.ai_client.set_recognition_enabled(enabled)
+        self.ai_status_signal.emit(f"AI: recognition {self._onoff(result)}")
+        return result
+
+    def refresh_ai_status(self):
+        self.run_ai_command("AI status", self._read_ai_status)
+
+    def _read_ai_status(self):
+        firmware = self.ai_client.request_firmware_version()
+        recognition = self.ai_client.get_recognition_enabled()
+        tracking = self.ai_client.get_tracking_status()
+        stream = self.ai_client.get_coordinate_stream_status()
+        text = f"AI: fw {firmware or '-'} | rec {self._onoff(recognition)} | track {self._onoff(tracking)} | stream {stream}"
+        self.ai_status_signal.emit(text)
+        return text
+
+    def track_clicked_point(self, x: int, y: int):
+        if not hasattr(self, "ai_overlay_check"):
+            return
+        self.track_ai_point(x, y)
+
+    def track_ai_point(self, x: int, y: int):
+        overlay_enabled = self.ai_overlay_check.isChecked()
+        self.run_ai_command("AI track point", lambda: self._track_ai_point_worker(x, y, overlay_enabled))
+
+    def _track_ai_point_worker(self, x: int, y: int, overlay_enabled: bool):
+        recognition = self._prepare_ai_track()
+        result = self.ai_client.track_point(x, y)
+        if overlay_enabled:
+            time.sleep(0.10)
+            self._start_ai_overlay_worker()
+        return {"recognition": recognition, "track_result": result, "x": x, "y": y}
+
+    def track_ai_box(self, left: int, top: int, right: int, bottom: int):
+        self.last_selected_ai_box = None
+        self.ai_tracking_signal.emit(None)
+        self.ai_status_signal.emit(f"AI: ROI sent | {left},{top} - {right},{bottom}")
+        overlay_enabled = self.ai_overlay_check.isChecked()
+        self.run_ai_command(
+            "AI track box",
+            lambda: self._track_ai_box_worker(left, top, right, bottom, overlay_enabled),
+        )
+
+    def _track_ai_box_worker(self, left: int, top: int, right: int, bottom: int, overlay_enabled: bool):
+        recognition = self._prepare_ai_track()
+        result = self.ai_client.track_box(left, top, right, bottom)
+        if overlay_enabled:
+            time.sleep(0.10)
+            self._start_ai_overlay_worker()
+        return {
+            "recognition": recognition,
+            "track_result": result,
+            "box": (left, top, right, bottom),
+        }
+
+    def _prepare_ai_track(self):
+        try:
+            self.ai_client.stop_coordinate_listener()
+        except Exception:
+            pass
+        try:
+            self.ai_client.set_coordinate_stream_enabled(False)
+        except Exception:
+            pass
+        try:
+            self.ai_client.cancel_tracking()
+        except Exception:
+            pass
+        time.sleep(0.15)
+        try:
+            self.ai_client.set_rtsp_stream_enabled(True)
+        except Exception:
+            pass
+        return self.ai_client.set_recognition_enabled(True)
+
+    def cancel_ai_tracking(self):
+        self.run_ai_command("AI cancel tracking", self._cancel_ai_tracking_worker)
+
+    def _cancel_ai_tracking_worker(self):
+        try:
+            self.ai_client.stop_coordinate_listener()
+            self.ai_client.set_coordinate_stream_enabled(False)
+        except Exception:
+            pass
+        result = self.ai_client.cancel_tracking()
+        self.last_selected_ai_box = None
+        self.ai_tracking_signal.emit(None)
+        self.ai_status_signal.emit("AI: standby")
+        return result
+
+    def toggle_ai_overlay(self, enabled: bool):
+        if enabled:
+            self.run_ai_command("AI overlay on", self._start_ai_overlay_worker)
+        else:
+            self.run_ai_command("AI overlay off", self._stop_ai_overlay_worker)
+
+    def _start_ai_overlay_worker(self):
+        stream_enabled = self.ai_client.set_coordinate_stream_enabled(True)
+        self.ai_client.start_coordinate_listener(
+            lambda box: self.ai_tracking_signal.emit(box),
+            lambda exc: self.log_message(f"AI overlay listener: ERROR {exc}"),
+        )
+        return stream_enabled
+
+    def _stop_ai_overlay_worker(self):
+        try:
+            stream_enabled = self.ai_client.set_coordinate_stream_enabled(False)
+        finally:
+            self.ai_client.stop_coordinate_listener()
+            self.ai_tracking_signal.emit(None)
+        return stream_enabled
+
+    def _apply_ai_tracking_box(self, box):
+        if box and hasattr(self, "ai_status_label"):
+            if box.target_id == 255:
+                self.ai_status_label.setText(f"AI: camera feedback | {box.x},{box.y}")
+            else:
+                self.ai_status_label.setText(f"AI: {box.target_type} | {box.state} | {box.x},{box.y}")
+        elif box is None:
+            self.video_stage.set_ai_tracking_box(None)
+            self.last_selected_ai_box = None
+
+    def _apply_ai_status(self, text: str):
+        if hasattr(self, "ai_status_label"):
+            self.ai_status_label.setText(text)
+
+    @staticmethod
+    def _is_unhelpful_full_frame_ai_box(box: AITrackingBox) -> bool:
+        return (
+            box.target_id == 255
+            and box.track_state == 4
+            and box.width >= AI_COORD_SIZE[0] * 0.90
+            and box.height >= AI_COORD_SIZE[1] * 0.90
+        )
+
+    @staticmethod
+    def _onoff(value: Optional[bool]) -> str:
+        if value is None:
+            return "-"
+        return "on" if value else "off"
 
     def run_command(self, label: str, command: Callable):
         if not self._ensure_client():
@@ -1288,173 +1997,259 @@ class ZT30QtDashboard(QMainWindow):
         if self.client:
             self.client.close()
 
+        if self.ai_client:
+            self.ai_client.close()
+
         event.accept()
 
     def _apply_style(self):
         QApplication.instance().setStyleSheet(
             """
             QWidget {
-                background: #0f1318;
-                color: #e8edf2;
-                font-family: Inter, Segoe UI, Arial;
+                background: transparent;
+                color: #f2f2ef;
+                font-family: "Liberation Sans", "Inter", "Segoe UI", Arial, sans-serif;
                 font-size: 13px;
             }
 
-            QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox {
-                background: #151b22;
-                border: 1px solid #2a3440;
-                border-radius: 6px;
-                padding: 7px 9px;
-                min-height: 20px;
-                color: #eef3f7;
-                selection-background-color: #1f8f7a;
+            QMainWindow {
+                background: #000000;
             }
 
-            QPushButton, QToolButton {
-                background: #19212a;
-                border: 1px solid #303b47;
-                border-radius: 7px;
-                padding: 8px 12px;
-                font-weight: 600;
-                color: #edf2f7;
+            QFrame#toolbar,
+            QFrame#sidePanel,
+            QFrame#controlWrapper,
+            QGroupBox {
+                background: rgba(6, 10, 11, 188);
+                border: 1px solid rgba(93, 129, 130, 118);
+                border-radius: 8px;
             }
 
-            QPushButton:hover, QToolButton:hover {
-                background: #202b36;
-                border-color: #3d4d5d;
-            }
-
-            QPushButton:pressed, QToolButton:pressed {
-                background: #111820;
-            }
-
-            #chip:checked {
-                background: #1f8f7a;
-                border-color: #2db69c;
-                color: #ffffff;
-            }
-
-            #toolbar, #sidePanel, QGroupBox, #controlWrapper {
-                background: #151b22;
-                border: 1px solid #252f3a;
-                border-radius: 10px;
-            }
-
-            #controlScroll {
-                background: transparent;
-                border: 0;
-            }
-
-            #sidebarToggle {
-                background: #151b22;
-                border: 1px solid #2a3440;
-                color: #aeb8c4;
-                padding: 8px 10px;
-            }
-
-            #sidebarToggle:hover {
-                color: #ffffff;
-                border-color: #1f8f7a;
-            }
-
-            #toolbar {
+            QFrame#toolbar {
                 max-height: 58px;
+            }
+
+            QFrame#sidePanel {
+                background: rgba(5, 9, 10, 205);
             }
 
             QGroupBox {
                 margin-top: 12px;
                 padding: 14px;
-                font-weight: 700;
+                font-weight: 900;
             }
 
             QGroupBox::title {
                 subcontrol-origin: margin;
                 left: 12px;
-                padding: 0 5px;
-                color: #cfd8e3;
-                background: #151b22;
+                padding: 0 7px;
+                color: #f2f2ef;
+                background: rgba(6, 10, 11, 225);
+                font-weight: 900;
+            }
+
+            QLineEdit,
+            QSpinBox,
+            QDoubleSpinBox,
+            QComboBox {
+                color: #f2f2ef;
+                background: rgba(6, 9, 10, 220);
+                border: 1px solid rgba(98, 122, 122, 125);
+                border-radius: 6px;
+                padding: 7px 9px;
+                min-height: 20px;
+                selection-background-color: #58f7e8;
+            }
+
+            QLineEdit:focus,
+            QSpinBox:focus,
+            QDoubleSpinBox:focus,
+            QComboBox:focus {
+                border-color: rgba(207, 255, 251, 220);
+                background: rgba(9, 18, 19, 230);
+            }
+
+            QComboBox::drop-down {
+                border: none;
+                width: 24px;
+            }
+
+            QComboBox QAbstractItemView {
+                color: #f2f2ef;
+                background: #071012;
+                border: 1px solid rgba(130, 190, 190, 150);
+                selection-background-color: #58f7e8;
+                selection-color: #061010;
+            }
+
+            QPushButton, QToolButton {
+                color: #f2f2ef;
+                background: rgba(10, 14, 15, 205);
+                border: 1px solid rgba(98, 122, 122, 112);
+                border-radius: 6px;
+                padding: 9px 13px;
+                font-weight: 900;
+                min-height: 32px;
+            }
+
+            QPushButton:hover, QToolButton:hover {
+                color: #ffffff;
+                background: #1a1f1f;
+                border-color: #d7dbdb;
+            }
+
+            QPushButton:pressed, QToolButton:pressed {
+                color: #061010;
+                background: #ffffff;
+                border-color: #ffffff;
+            }
+
+            QPushButton:disabled, QToolButton:disabled {
+                color: #657171;
+                background: #101515;
+                border-color: #252d2d;
+            }
+
+            QCheckBox {
+                color: #dce8e8;
+                spacing: 8px;
+            }
+
+            QCheckBox::indicator {
+                width: 18px;
+                height: 18px;
+                border-radius: 4px;
+                border: 1px solid rgba(170, 205, 205, 160);
+                background: rgba(0, 0, 0, 155);
+            }
+
+            QCheckBox::indicator:hover {
+                border-color: #ffffff;
+            }
+
+            QCheckBox::indicator:checked {
+                background: #58f7e8;
+                border-color: #cffffb;
+            }
+
+            QTableWidget {
+                color: #f2f2ef;
+                background: rgba(6, 9, 10, 185);
+                border: 1px solid rgba(98, 122, 122, 112);
+                border-radius: 6px;
+                gridline-color: rgba(93, 129, 130, 90);
+                selection-background-color: rgba(88, 247, 232, 190);
+                selection-color: #061010;
+            }
+
+            QHeaderView::section {
+                color: #061010;
+                background: #58f7e8;
+                border: none;
+                padding: 5px 7px;
+                font-weight: 900;
+            }
+
+            QScrollArea,
+            QFrame#controlScroll {
+                background: transparent;
+                border: none;
+            }
+
+            #sidebarToggle {
+                color: #aebbbb;
+                background: rgba(6, 10, 11, 190);
+                border: 1px solid rgba(93, 129, 130, 118);
+                padding: 8px 10px;
+            }
+
+            #sidebarToggle:hover {
+                color: #ffffff;
+                border-color: rgba(207, 255, 252, 190);
             }
 
             #videoStage {
-                background: #05070a;
-                border-radius: 12px;
-                border: 1px solid #2c3744;
+                background: rgba(0, 0, 0, 185);
+                border-radius: 8px;
+                border: 1px solid rgba(112, 160, 160, 130);
             }
 
             #mainVideo {
-                background: #030507;
-                color: #73808e;
-                border-radius: 12px;
+                background: #000000;
+                color: #86a2a2;
+                border-radius: 8px;
                 font-size: 18px;
             }
 
             #pipVideo {
-                background: #030507;
-                color: #b5c0cb;
-                border: 2px solid #d6dde5;
-                border-radius: 8px;
+                background: #000000;
+                color: #f2f2ef;
+                border: 2px solid #f2f2ef;
+                border-radius: 7px;
                 margin: 18px;
             }
 
             #statusBadge {
-                background: #123f37;
-                color: #6ee7c8;
-                border-radius: 11px;
-                padding: 5px 10px;
-                font-weight: 700;
+                color: #061010;
+                background: #58f7e8;
+                border-radius: 5px;
+                padding: 5px 9px;
+                font-weight: 900;
             }
 
             #metricLabel {
-                color: #8f9ba8;
+                color: #aebbbb;
                 font-size: 12px;
             }
 
             #metricValue {
-                color: #f2f6fa;
+                color: #ffffff;
                 font-size: 20px;
-                font-weight: 700;
+                font-weight: 900;
             }
 
             #log {
-                background: #0f141a;
-                border: 1px solid #252f3a;
-                border-radius: 8px;
-                color: #b9c4cf;
-            }
-
-            QCheckBox {
-                color: #dce4ec;
-                spacing: 8px;
+                color: #aebbbb;
+                background: rgba(6, 9, 10, 220);
+                border: 1px solid rgba(98, 122, 122, 112);
+                border-radius: 6px;
             }
 
             QScrollBar:vertical {
-                background: #10161d;
-                width: 10px;
-                margin: 0;
-                border-radius: 5px;
+                background: rgba(4, 7, 8, 160);
+                width: 12px;
+                margin: 0px;
             }
 
             QScrollBar::handle:vertical {
-                background: #303c49;
-                min-height: 28px;
+                background: rgba(134, 162, 162, 150);
                 border-radius: 5px;
+                min-height: 30px;
             }
 
             QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
-                height: 0;
+                height: 0px;
             }
 
             QSlider::groove:horizontal {
                 height: 6px;
-                background: #293440;
+                background: rgba(6, 9, 10, 220);
+                border: 1px solid rgba(98, 122, 122, 112);
                 border-radius: 3px;
             }
 
             QSlider::handle:horizontal {
-                background: #1f8f7a;
+                background: #58f7e8;
                 width: 16px;
                 margin: -5px 0;
                 border-radius: 8px;
+            }
+
+            QToolTip {
+                color: #f2f2ef;
+                background: #071012;
+                border: 1px solid #58f7e8;
+                padding: 6px;
             }
             """
         )

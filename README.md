@@ -6,6 +6,7 @@ Default device settings:
 
 ```text
 ZT30 IP      : 192.168.144.25
+AI module IP : 192.168.144.60
 SDK UDP port : 37260
 RTSP main    : rtsp://192.168.144.25:8554/video1
 RTSP sub     : rtsp://192.168.144.25:8554/video2
@@ -53,6 +54,18 @@ Implemented command groups:
 - Camera and gimbal soft restart
 - Raw hex sending for debugging
 
+### AI Tracking Module II SDK
+
+Implemented command groups:
+
+- AI module firmware version
+- AI recognition ON/OFF request and configuration
+- AI tracking status request
+- Track target by point or selection box
+- Cancel target tracking
+- Tracking coordinate stream status request and configuration
+- Automatic tracking coordinate stream listener
+
 ### Web media helper
 
 Implemented HTTP helpers:
@@ -67,8 +80,8 @@ The included PyQt5 dashboard provides:
 
 - Connection setting
 - Large main live view focused on the video stream
-- Switchable Video 1 / Video 2 live stream
-- Optional picture-in-picture view between Video 1 and Video 2
+- Switchable primary live view between AI Camera and Video 1
+- Optional Video 2 picture-in-picture with fast main/PiP window swap
 - Collapsible right control panel
 - Gimbal pan and tilt movement buttons
 - Joystick pan and tilt control through `/dev/input/js0`
@@ -78,6 +91,9 @@ The included PyQt5 dashboard provides:
 - Zoom and focus controls
 - Photo and record buttons
 - Camera view selector with common names
+- SIYI AI Tracking Module II controls
+- Click-to-track target selection on the live view
+- AI tracking target box overlay
 - Laser rangefinder controls
 - Thermal palette controls
 - Full image and point thermometric request
@@ -140,6 +156,7 @@ Test connection:
 
 ```bash
 ping 192.168.144.25
+ping 192.168.144.60
 ```
 
 ## Run the example
@@ -148,6 +165,12 @@ From the package root:
 
 ```bash
 python3 examples/basic_control.py
+```
+
+Run the AI tracking module example:
+
+```bash
+python3 examples/ai_tracking.py
 ```
 
 ## Run the UI
@@ -189,7 +212,38 @@ print(cam.request_laser_range())
 cam.close()
 ```
 
+AI Tracking Module II usage:
+
+```python
+from siyi_zt30 import SiyiAITrackingClient
+
+ai = SiyiAITrackingClient("192.168.144.60")
+
+print(ai.request_firmware_version())
+ai.set_recognition_enabled(True)
+ai.track_point(640, 360)
+ai.set_coordinate_stream_enabled(True)
+
+ai.start_coordinate_listener(lambda box: print(box))
+```
+
 ## Important operation notes
+
+For AI tracking, the dashboard normalizes live-view clicks to the module coordinate
+space documented by SIYI: 1280 x 720. Use the AI module IP field when your module
+address differs from the default `192.168.144.60`.
+
+For selecting AI targets, use the AI RTSP stream:
+
+```text
+rtsp://192.168.144.60:554/video0
+```
+
+The dashboard's AI RTSP mode enables the module RTSP switch through SDK command
+`0x0B` and opens the stream over UDP transport. The camera streams
+`rtsp://192.168.144.25:8554/video1` and `rtsp://192.168.144.25:8554/video2` are still
+available for normal monitoring, but AI target selection should be done against the AI
+camera stream.
 
 For speed movement, always send stop after releasing a button or joystick:
 

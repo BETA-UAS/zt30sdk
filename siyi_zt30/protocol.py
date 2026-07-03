@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import struct
-from typing import Optional
+from typing import List, Optional
 
 STX = b"\x55\x66"
 
@@ -97,6 +97,29 @@ def parse_packet(raw: bytes, validate_crc: bool = True) -> SiyiPacket:
             raise SiyiProtocolError(f"CRC mismatch: rx=0x{crc_rx:04X}, calc=0x{crc_calc:04X}")
 
     return SiyiPacket(ctrl=ctrl, data_len=data_len, seq=seq, cmd_id=cmd_id, payload=payload, crc=crc_rx, raw=raw)
+
+
+def parse_packets(raw: bytes, validate_crc: bool = True) -> List[SiyiPacket]:
+    """Parse one or more SIYI packets from a single byte buffer."""
+    packets = []
+    offset = 0
+
+    while offset < len(raw):
+        stx_at = raw.find(STX, offset)
+        if stx_at < 0:
+            break
+        if len(raw) - stx_at < 10:
+            break
+
+        data_len = struct.unpack("<H", raw[stx_at + 3:stx_at + 5])[0]
+        packet_len = 8 + data_len + 2
+        if len(raw) - stx_at < packet_len:
+            break
+
+        packets.append(parse_packet(raw[stx_at:stx_at + packet_len], validate_crc=validate_crc))
+        offset = stx_at + packet_len
+
+    return packets
 
 
 def hexdump(data: Optional[bytes]) -> str:
