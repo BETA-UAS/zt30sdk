@@ -14,5 +14,11 @@ env/
 build/
 dist/
 *.egg-info/
+build-*/
+*.spec
+*.AppImage
+*.AppDir/
+appimagetool-*.AppImage
+run_dashboard.sh
 
 .DS_Store

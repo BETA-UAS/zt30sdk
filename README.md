@@ -125,6 +125,22 @@ python3 -m pip install PyQt5
 
 If `ffplay` is available from the FFmpeg package, the dashboard can also open a stream in an external FFplay window.
 
+## Quick setup
+
+Install the Python environment and create a launcher:
+
+```bash
+./setup.sh
+./run_dashboard.sh
+```
+
+Build a Linux AppImage:
+
+```bash
+./install.sh
+./ZT30Control.AppImage
+```
+
 Joystick control uses the Linux joystick event device directly:
 
 ```text
