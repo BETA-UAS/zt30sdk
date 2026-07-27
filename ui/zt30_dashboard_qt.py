@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import math
 import os
+import select
 import shutil
 import struct
 import subprocess
@@ -140,13 +141,25 @@ class FFmpegStreamThread(QThread):
     frame_ready = pyqtSignal(QImage)
     status_changed = pyqtSignal(str)
     error = pyqtSignal(str)
+    stalled = pyqtSignal(str)
 
-    def __init__(self, url: str, width: int, height: int, transport: str = "tcp", parent=None):
+    def __init__(
+        self,
+        url: str,
+        width: int,
+        height: int,
+        transport: str = "tcp",
+        name: str = "stream",
+        frame_timeout: float = 5.0,
+        parent=None,
+    ):
         super().__init__(parent)
         self.url = url
         self.width = width
         self.height = height
         self.transport = transport
+        self.name = name
+        self.frame_timeout = frame_timeout
         self._running = False
         self._process: Optional[subprocess.Popen] = None
 
@@ -192,14 +205,20 @@ class FFmpegStreamThread(QThread):
             self._process = subprocess.Popen(
                 cmd,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
                 bufsize=frame_bytes * 2,
             )
 
             self.status_changed.emit("Live")
 
             while self._running and self._process.stdout is not None:
-                frame = self._read_exact(frame_bytes)
+                try:
+                    frame = self._read_exact(frame_bytes)
+                except TimeoutError:
+                    self.error.emit(f"{self.name}: stalled, no complete frame for {self.frame_timeout:.1f}s")
+                    self.stalled.emit(self.name)
+                    break
+
                 if frame is None:
                     break
 
@@ -232,8 +251,20 @@ class FFmpegStreamThread(QThread):
             return None
 
         data = bytearray()
+        deadline = time.monotonic() + self.frame_timeout
 
         while self._running and len(data) < size:
+            if self._process.poll() is not None:
+                return None
+
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError
+
+            ready, _, _ = select.select([self._process.stdout], [], [], min(0.25, remaining))
+            if not ready:
+                continue
+
             chunk = self._process.stdout.read(size - len(data))
             if not chunk:
                 return None
@@ -1417,6 +1448,7 @@ class ZT30QtDashboard(QMainWindow):
             *STREAM_SIZE,
             lambda image: self._handle_source_frame("primary", image),
             transport=primary_source["transport"],
+            name="primary",
         )
 
         self.pip_thread = self._start_stream(
@@ -1424,6 +1456,7 @@ class ZT30QtDashboard(QMainWindow):
             *STREAM_SIZE,
             lambda image: self._handle_source_frame("video2", image),
             transport=video2_source["transport"],
+            name="video2",
         )
 
         self._render_video_layout()
@@ -1450,11 +1483,12 @@ class ZT30QtDashboard(QMainWindow):
 
         raise ValueError(f"unknown source {name!r}")
 
-    def _start_stream(self, url: str, width: int, height: int, frame_slot, transport: str = "tcp"):
-        thread = FFmpegStreamThread(url, width, height, transport, self)
+    def _start_stream(self, url: str, width: int, height: int, frame_slot, transport: str = "tcp", name: str = "stream"):
+        thread = FFmpegStreamThread(url, width, height, transport=transport, name=name, parent=self)
         thread.frame_ready.connect(frame_slot)
         thread.status_changed.connect(self.status_badge.setText)
         thread.error.connect(lambda text: self.log_message(f"stream error: {text}"))
+        thread.stalled.connect(self._handle_stream_stalled)
         thread.start()
         self.log_message(f"Playing {url}")
         return thread
@@ -1495,6 +1529,37 @@ class ZT30QtDashboard(QMainWindow):
 
         if self.ai_client:
             self._set_ai_rtsp_enabled(False)
+
+    def _handle_stream_stalled(self, name: str):
+        if name != "video2":
+            return
+
+        self.log_message("video2 stream stalled: restarting PiP")
+        QTimer.singleShot(250, self._restart_pip_stream)
+
+    def _restart_pip_stream(self):
+        if self.pip_thread:
+            self.pip_thread.stop()
+            self.pip_thread = None
+
+        if not self.main_thread:
+            return
+
+        try:
+            video2_source = self._source_spec("Video 2")
+        except Exception as exc:
+            self.log_message(f"video2 restart: ERROR {exc}")
+            return
+
+        self.video2_frame = None
+        self._render_video_layout()
+        self.pip_thread = self._start_stream(
+            video2_source["url"],
+            *STREAM_SIZE,
+            lambda image: self._handle_source_frame("video2", image),
+            transport=video2_source["transport"],
+            name="video2",
+        )
 
     def _set_ai_rtsp_enabled(self, enabled: bool):
         try:
