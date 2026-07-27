@@ -158,7 +158,7 @@ class FFmpegStreamThread(QThread):
         frame_bytes = self.width * self.height * 3
         vf = (
             f"fps=20,scale={self.width}:{self.height}:force_original_aspect_ratio=decrease,"
-            f"pad={self.width}:{self.height}:(ow-iw)/2:(oh-ih)/2"
+            f"pad={self.width}:{self.height}:(ow-iw)/2:(oh-ih)/2,setsar=1"
         )
 
         cmd = [
@@ -172,6 +172,7 @@ class FFmpegStreamThread(QThread):
             "nobuffer",
             "-flags",
             "low_delay",
+            "-noautorotate",
             "-i",
             self.url,
             "-an",
@@ -209,6 +210,12 @@ class FFmpegStreamThread(QThread):
                     self.width * 3,
                     QImage.Format_RGB888,
                 ).copy()
+
+                if image.isNull() or image.width() != self.width or image.height() != self.height:
+                    self.error.emit(
+                        f"ignored unexpected frame size {image.width()}x{image.height()}"
+                    )
+                    continue
 
                 self.frame_ready.emit(image)
 
