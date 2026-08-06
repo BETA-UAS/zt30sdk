@@ -65,15 +65,36 @@ class ZT30UDPClient:
 
     def send(self, cmd_id: int, payload: bytes = b"", wait_response: bool = True, need_ack: bool = True) -> Optional[SiyiPacket]:
         with self._io_lock:
-            packet = build_packet(cmd_id, payload, seq=self._next_seq(), need_ack=need_ack)
+            seq = self._next_seq()
+            packet = build_packet(cmd_id, payload, seq=seq, need_ack=need_ack)
             self.sock.sendto(packet, (self.host, self.port))
             if not wait_response:
                 return None
-            try:
-                raw, _ = self.sock.recvfrom(4096)
-            except socket.timeout:
-                return None
-            return parse_packet(raw, validate_crc=self.validate_crc)
+
+            # Function feedback (0x0B) and delayed UDP replies may already be
+            # queued. Do not let one of those packets masquerade as this
+            # command's response.
+            deadline = time.monotonic() + self.timeout
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return None
+                self.sock.settimeout(remaining)
+                try:
+                    raw, _ = self.sock.recvfrom(4096)
+                except socket.timeout:
+                    return None
+                finally:
+                    self.sock.settimeout(self.timeout)
+
+                response = parse_packet(raw, validate_crc=self.validate_crc)
+                if response.cmd_id != cmd_id:
+                    continue
+                # Current SIYI firmware echoes the request sequence. Retain
+                # compatibility with firmware that returns sequence zero.
+                if response.seq not in (seq, 0):
+                    continue
+                return response
 
     def send_raw_hex(self, hex_string: str, wait_response: bool = True) -> Optional[SiyiPacket]:
         with self._io_lock:
@@ -255,7 +276,13 @@ class ZT30UDPClient:
             func_id = PHOTO_RECORD_FUNC[func]
         else:
             func_id = int(func)
-        return self.send(0x0C, struct.pack("<B", func_id), wait_response=wait_response)
+        # CMD 0x0C is explicitly documented as a no-ACK command.
+        return self.send(
+            0x0C,
+            struct.pack("<B", func_id),
+            wait_response=wait_response,
+            need_ack=False,
+        )
 
     def take_photo(self) -> None:
         self.camera_function("photo", wait_response=False)

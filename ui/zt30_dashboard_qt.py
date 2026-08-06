@@ -60,8 +60,12 @@ from siyi_zt30.constants import IMAGE_MODE_BY_NAME, IMAGE_MODES, THERMAL_PALETTE
 
 
 STREAM_SIZE = (960, 540)
+PIP_STREAM_SIZE = (480, 270)
+MAIN_STREAM_FPS = 15
+PIP_STREAM_FPS = 8
 PIP_SIZE_DEFAULT = (320, 180)
 AI_COORD_SIZE = (1280, 720)
+THERMAL_COORD_SIZE = (640, 512)
 
 CAMERA_VIEWS = {
     "Zoom + Thermal": "single_zoom_sub_thermal",
@@ -103,13 +107,6 @@ class CockpitBackground(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._phase = 0
-        self._timer = QTimer(self)
-        self._timer.timeout.connect(self._tick)
-        self._timer.start(55)
-
-    def _tick(self):
-        self._phase = (self._phase + 1) % 720
-        self.update()
 
     def paintEvent(self, event):
         painter = QPainter(self)
@@ -151,6 +148,7 @@ class FFmpegStreamThread(QThread):
         transport: str = "tcp",
         name: str = "stream",
         frame_timeout: float = 5.0,
+        fps: int = MAIN_STREAM_FPS,
         parent=None,
     ):
         super().__init__(parent)
@@ -160,6 +158,7 @@ class FFmpegStreamThread(QThread):
         self.transport = transport
         self.name = name
         self.frame_timeout = frame_timeout
+        self.fps = max(1, int(fps))
         self._running = False
         self._process: Optional[subprocess.Popen] = None
 
@@ -170,7 +169,7 @@ class FFmpegStreamThread(QThread):
 
         frame_bytes = self.width * self.height * 3
         vf = (
-            f"fps=20,scale={self.width}:{self.height}:force_original_aspect_ratio=decrease,"
+            f"fps={self.fps},scale={self.width}:{self.height}:force_original_aspect_ratio=decrease,"
             f"pad={self.width}:{self.height}:(ow-iw)/2:(oh-ih)/2,setsar=1"
         )
 
@@ -461,15 +460,16 @@ class VideoStage(QFrame):
         self._ai_tracking_box: Optional[AITrackingBox] = None
         self._selection_start: Optional[tuple[int, int]] = None
         self._selection_end: Optional[tuple[int, int]] = None
+        self._thermal_measurement = None
 
     def set_main_frame(self, image: QImage):
         self._main_pixmap = QPixmap.fromImage(image)
-        self._refresh_pixmaps()
+        self._refresh_main_pixmap()
 
     def set_pip_frame(self, image: QImage):
         self._pip_pixmap = QPixmap.fromImage(image)
         self.pip_label.show()
-        self._refresh_pixmaps()
+        self._refresh_pip_pixmap()
 
     def clear_main(self, text: str):
         self._main_pixmap = None
@@ -500,26 +500,35 @@ class VideoStage(QFrame):
         self._ai_tracking_box = box
         self._refresh_pixmaps()
 
+    def set_thermal_measurement(self, measurement):
+        self._thermal_measurement = measurement
+        self._refresh_main_pixmap()
+
     def resizeEvent(self, event):
         super().resizeEvent(event)
         self._refresh_pixmaps()
 
     def _refresh_pixmaps(self):
+        self._refresh_main_pixmap()
+        self._refresh_pip_pixmap()
+
+    def _refresh_main_pixmap(self):
         if self._main_pixmap:
             pixmap = self._main_pixmap.scaled(
                 self.main_label.size(),
                 Qt.KeepAspectRatio,
-                Qt.SmoothTransformation,
+                Qt.FastTransformation,
             )
             self._draw_main_overlay(pixmap)
             self.main_label.setPixmap(pixmap)
 
+    def _refresh_pip_pixmap(self):
         if self._pip_pixmap:
             self.pip_label.setPixmap(
                 self._pip_pixmap.scaled(
                     self.pip_label.size(),
                     Qt.KeepAspectRatio,
-                    Qt.SmoothTransformation,
+                    Qt.FastTransformation,
                 )
             )
 
@@ -570,7 +579,41 @@ class VideoStage(QFrame):
         if self._selection_start and self._selection_end:
             self._draw_selection_box(painter, pixmap)
 
+        if self._thermal_measurement:
+            self._draw_thermal_measurement(painter, pixmap, self._thermal_measurement)
+
         painter.end()
+
+    def _draw_thermal_measurement(self, painter: QPainter, pixmap: QPixmap, data):
+        scale_x = pixmap.width() / AI_COORD_SIZE[0]
+        scale_y = pixmap.height() / AI_COORD_SIZE[1]
+        painter.setFont(QFont("Inter", 11, QFont.Bold))
+
+        def marker(x, y, text, color):
+            px = clamp(round(x * scale_x), 0, pixmap.width() - 1)
+            py = clamp(round(y * scale_y), 0, pixmap.height() - 1)
+            painter.setPen(QPen(QColor(0, 0, 0, 220), 5))
+            painter.drawEllipse(QPoint(px, py), 5, 5)
+            painter.setPen(QPen(color, 2))
+            painter.drawEllipse(QPoint(px, py), 5, 5)
+            text_rect = QRect(px + 10, max(2, py - 24), 150, 24)
+            painter.fillRect(text_rect, QColor(0, 0, 0, 190))
+            painter.drawText(text_rect.adjusted(5, 0, -2, 0), Qt.AlignVCenter, text)
+
+        if data.get("kind") == "point":
+            marker(data["x"], data["y"], f'{data["temperature_c"]:.1f} °C', QColor("#ffffff"))
+            return
+
+        left, top, right, bottom = data["box"]
+        rect = QRect(
+            round(left * scale_x), round(top * scale_y),
+            max(2, round((right - left) * scale_x)),
+            max(2, round((bottom - top) * scale_y)),
+        )
+        painter.setPen(QPen(QColor("#ffffff"), 2))
+        painter.drawRect(rect)
+        marker(data["max_x"], data["max_y"], f'MAX {data["max_c"]:.1f} °C', QColor("#ff5252"))
+        marker(data["min_x"], data["min_y"], f'MIN {data["min_c"]:.1f} °C', QColor("#40c4ff"))
 
     def _draw_ai_tracking_box(self, painter: QPainter, pixmap: QPixmap, box: AITrackingBox):
         scale_x = pixmap.width() / AI_COORD_SIZE[0]
@@ -717,6 +760,8 @@ class ZT30QtDashboard(QMainWindow):
     ai_tracking_signal = pyqtSignal(object)
     ai_status_signal = pyqtSignal(str)
     media_list_signal = pyqtSignal(object, object)
+    record_status_signal = pyqtSignal(str)
+    thermal_result_signal = pyqtSignal(object)
 
     def __init__(self):
         super().__init__()
@@ -745,6 +790,12 @@ class ZT30QtDashboard(QMainWindow):
         self.current_media_type = 0
         self.media_items = []
         self._updating_sources = False
+        self.recording = False
+        self.record_command_pending = False
+        self.status_refresh_pending = False
+        self.laser_refresh_pending = False
+        self.video_render_pending = False
+        self.thermal_tool_enabled = False
 
         self._build_ui()
         self._apply_style()
@@ -755,16 +806,24 @@ class ZT30QtDashboard(QMainWindow):
         self.ai_tracking_signal.connect(self._apply_ai_tracking_box)
         self.ai_status_signal.connect(self._apply_ai_status)
         self.media_list_signal.connect(self._apply_media_list)
+        self.record_status_signal.connect(self._apply_record_status)
+        self.thermal_result_signal.connect(self._apply_thermal_result)
 
         self._ensure_client()
 
         self.telemetry_timer = QTimer(self)
         self.telemetry_timer.timeout.connect(self.refresh_status)
-        self.telemetry_timer.start(1500)
+        self.telemetry_timer.start(2500)
 
         self.laser_timer = QTimer(self)
         self.laser_timer.timeout.connect(self.refresh_laser_overlay)
-        self.laser_timer.start(2500)
+        self.laser_timer.start(4000)
+
+        # Coalesce incoming frames. Without this limiter, two streams can queue
+        # 30-40 full UI redraws per second on low-power field computers.
+        self.video_render_timer = QTimer(self)
+        self.video_render_timer.setSingleShot(True)
+        self.video_render_timer.timeout.connect(self._flush_video_render)
 
     def _build_ui(self):
         root = CockpitBackground()
@@ -799,7 +858,7 @@ class ZT30QtDashboard(QMainWindow):
         tools.addWidget(self.main_source_combo)
 
         self.pip_check = QCheckBox("Picture in Picture")
-        self.pip_check.setChecked(True)
+        self.pip_check.setChecked(False)
         self.pip_check.toggled.connect(self.handle_pip_toggle)
         tools.addWidget(self.pip_check)
 
@@ -834,7 +893,7 @@ class ZT30QtDashboard(QMainWindow):
         self.video_stage.pip_clicked.connect(self.swap_pip_view)
         self.video_stage.main_clicked.connect(self.track_clicked_point)
         self.video_stage.main_box_selected.connect(self.track_ai_box)
-        self.video_stage.cancel_requested.connect(self.cancel_ai_tracking)
+        self.video_stage.cancel_requested.connect(self.clear_screen_tool)
 
         column.addWidget(toolbar)
         column.addWidget(self.video_stage, 1)
@@ -947,17 +1006,21 @@ class ZT30QtDashboard(QMainWindow):
         photo = QPushButton("Photo")
         photo.clicked.connect(lambda: self.run_command("photo", self.client.take_photo))
 
-        record = QPushButton("Record")
-        record.clicked.connect(lambda: self.run_command("record", self.client.toggle_record))
+        self.record_button = QPushButton("Start Record")
+        self.record_button.clicked.connect(self.toggle_record)
+
+        self.record_indicator = QLabel("● NOT RECORDING")
+        self.record_indicator.setObjectName("recordIndicator")
 
         focus = QPushButton("Auto Focus")
         focus.clicked.connect(lambda: self.run_command("auto focus", self.client.auto_focus))
 
         row.addWidget(photo)
-        row.addWidget(record)
+        row.addWidget(self.record_button)
         row.addWidget(focus)
 
         box.layout().addLayout(row)
+        box.layout().addWidget(self.record_indicator)
         return box
 
     def _build_gimbal_controls(self):
@@ -1091,47 +1154,21 @@ class ZT30QtDashboard(QMainWindow):
 
         box.layout().addLayout(thermal_row)
 
-        self.temp_x_spin = QSpinBox()
-        self.temp_x_spin.setRange(0, 1920)
-        self.temp_x_spin.setValue(320)
+        self.thermal_tool_check = QCheckBox("Temperature Tool")
+        self.thermal_tool_check.toggled.connect(self.toggle_thermal_tool)
+        box.layout().addWidget(self.thermal_tool_check)
 
-        self.temp_y_spin = QSpinBox()
-        self.temp_y_spin.setRange(0, 1080)
-        self.temp_y_spin.setValue(256)
-
-        temp_coord_row = QHBoxLayout()
-        temp_coord_row.addWidget(QLabel("Point X"))
-        temp_coord_row.addWidget(self.temp_x_spin)
-        temp_coord_row.addWidget(QLabel("Y"))
-        temp_coord_row.addWidget(self.temp_y_spin)
-
-        box.layout().addLayout(temp_coord_row)
-
-        temp_row = QHBoxLayout()
-
-        point_temp = QPushButton("Point")
-        point_temp.clicked.connect(
-            lambda: self.run_command(
-                "point temperature",
-                lambda: self.client.request_temperature_point(
-                    self.temp_x_spin.value(),
-                    self.temp_y_spin.value(),
-                ),
-            )
+        self.thermal_help_label = QLabel(
+            "Enable, then click for temperature or drag a box for MIN / MAX. "
+            "Right-click the video to clear."
         )
+        self.thermal_help_label.setWordWrap(True)
+        self.thermal_help_label.setObjectName("metricLabel")
+        box.layout().addWidget(self.thermal_help_label)
 
-        full_temp = QPushButton("Full")
-        full_temp.clicked.connect(
-            lambda: self.run_command(
-                "full temperature",
-                self.client.request_temperature_full_image,
-            )
-        )
-
-        temp_row.addWidget(point_temp)
-        temp_row.addWidget(full_temp)
-
-        box.layout().addLayout(temp_row)
+        self.thermal_result_label = QLabel("Temperature: tool off")
+        self.thermal_result_label.setObjectName("thermalResult")
+        box.layout().addWidget(self.thermal_result_label)
 
         return box
 
@@ -1449,15 +1486,18 @@ class ZT30QtDashboard(QMainWindow):
             lambda image: self._handle_source_frame("primary", image),
             transport=primary_source["transport"],
             name="primary",
+            fps=MAIN_STREAM_FPS,
         )
 
-        self.pip_thread = self._start_stream(
-            video2_source["url"],
-            *STREAM_SIZE,
-            lambda image: self._handle_source_frame("video2", image),
-            transport=video2_source["transport"],
-            name="video2",
-        )
+        if self.pip_check.isChecked():
+            self.pip_thread = self._start_stream(
+                video2_source["url"],
+                *PIP_STREAM_SIZE,
+                lambda image: self._handle_source_frame("video2", image),
+                transport=video2_source["transport"],
+                name="video2",
+                fps=PIP_STREAM_FPS,
+            )
 
         self._render_video_layout()
 
@@ -1483,8 +1523,8 @@ class ZT30QtDashboard(QMainWindow):
 
         raise ValueError(f"unknown source {name!r}")
 
-    def _start_stream(self, url: str, width: int, height: int, frame_slot, transport: str = "tcp", name: str = "stream"):
-        thread = FFmpegStreamThread(url, width, height, transport=transport, name=name, parent=self)
+    def _start_stream(self, url: str, width: int, height: int, frame_slot, transport: str = "tcp", name: str = "stream", fps: int = MAIN_STREAM_FPS):
+        thread = FFmpegStreamThread(url, width, height, transport=transport, name=name, fps=fps, parent=self)
         thread.frame_ready.connect(frame_slot)
         thread.status_changed.connect(self.status_badge.setText)
         thread.error.connect(lambda text: self.log_message(f"stream error: {text}"))
@@ -1498,6 +1538,14 @@ class ZT30QtDashboard(QMainWindow):
             self.primary_frame = image
         elif source == "video2":
             self.video2_frame = image
+        self.video_render_pending = True
+        if not self.video_render_timer.isActive():
+            self.video_render_timer.start(66)
+
+    def _flush_video_render(self):
+        if not self.video_render_pending:
+            return
+        self.video_render_pending = False
         self._render_video_layout()
 
     def _render_video_layout(self):
@@ -1526,6 +1574,8 @@ class ZT30QtDashboard(QMainWindow):
         self.video_stage.set_pip_enabled(False)
         self.primary_frame = None
         self.video2_frame = None
+        self.video_render_pending = False
+        self.video_render_timer.stop()
 
         if self.ai_client:
             self._set_ai_rtsp_enabled(False)
@@ -1555,10 +1605,11 @@ class ZT30QtDashboard(QMainWindow):
         self._render_video_layout()
         self.pip_thread = self._start_stream(
             video2_source["url"],
-            *STREAM_SIZE,
+            *PIP_STREAM_SIZE,
             lambda image: self._handle_source_frame("video2", image),
             transport=video2_source["transport"],
             name="video2",
+            fps=PIP_STREAM_FPS,
         )
 
     def _set_ai_rtsp_enabled(self, enabled: bool):
@@ -1571,6 +1622,23 @@ class ZT30QtDashboard(QMainWindow):
             return None
 
     def handle_pip_toggle(self, enabled: bool):
+        if enabled and self.main_thread and not self.pip_thread:
+            try:
+                video2_source = self._source_spec("Video 2")
+                self.pip_thread = self._start_stream(
+                    video2_source["url"],
+                    *PIP_STREAM_SIZE,
+                    lambda image: self._handle_source_frame("video2", image),
+                    transport=video2_source["transport"],
+                    name="video2",
+                    fps=PIP_STREAM_FPS,
+                )
+            except Exception as exc:
+                self.log_message(f"video2 start: ERROR {exc}")
+        elif not enabled and self.pip_thread:
+            self.pip_thread.stop()
+            self.pip_thread = None
+            self.video2_frame = None
         self._render_video_layout()
 
     def handle_source_change(self):
@@ -1616,12 +1684,13 @@ class ZT30QtDashboard(QMainWindow):
             self.log_message(f"laser {'on' if enabled else 'off'}: ERROR {exc}")
 
     def refresh_laser_overlay(self):
-        if not self.laser_enabled:
+        if not self.laser_enabled or self.laser_refresh_pending:
             return
 
         if not self._ensure_client():
             return
 
+        self.laser_refresh_pending = True
         threading.Thread(target=self._update_laser_measurement, daemon=True).start()
 
     def _update_laser_measurement(self):
@@ -1632,6 +1701,8 @@ class ZT30QtDashboard(QMainWindow):
             self.log_message("laser overlay: updated")
         except Exception as exc:
             self.log_message(f"laser overlay: ERROR {exc}")
+        finally:
+            self.laser_refresh_pending = False
 
     def _laser_overlay_lines(self):
         lines = ["LASER RANGEFINDER"]
@@ -1818,9 +1889,114 @@ class ZT30QtDashboard(QMainWindow):
         return text
 
     def track_clicked_point(self, x: int, y: int):
+        if self.thermal_tool_enabled:
+            tx, ty = self._ai_to_thermal(x, y)
+            self.thermal_result_label.setText("Temperature: reading...")
+            threading.Thread(
+                target=self._temperature_point_worker,
+                args=(tx, ty),
+                daemon=True,
+            ).start()
+            return
         if not hasattr(self, "ai_overlay_check"):
             return
         self.track_ai_point(x, y)
+
+    @staticmethod
+    def _ai_to_thermal(x: int, y: int) -> tuple[int, int]:
+        return (
+            clamp(round(x * (THERMAL_COORD_SIZE[0] - 1) / (AI_COORD_SIZE[0] - 1)), 0, THERMAL_COORD_SIZE[0] - 1),
+            clamp(round(y * (THERMAL_COORD_SIZE[1] - 1) / (AI_COORD_SIZE[1] - 1)), 0, THERMAL_COORD_SIZE[1] - 1),
+        )
+
+    @staticmethod
+    def _thermal_to_ai(x: int, y: int) -> tuple[int, int]:
+        return (
+            clamp(round(x * (AI_COORD_SIZE[0] - 1) / (THERMAL_COORD_SIZE[0] - 1)), 0, AI_COORD_SIZE[0] - 1),
+            clamp(round(y * (AI_COORD_SIZE[1] - 1) / (THERMAL_COORD_SIZE[1] - 1)), 0, AI_COORD_SIZE[1] - 1),
+        )
+
+    def toggle_thermal_tool(self, enabled: bool):
+        self.thermal_tool_enabled = bool(enabled)
+        self.video_stage.set_thermal_measurement(None)
+        self.video_stage.main_label.setCursor(Qt.CrossCursor if enabled else Qt.ArrowCursor)
+        if not enabled:
+            self.thermal_result_label.setText("Temperature: tool off")
+            return
+
+        # Use the thermal sensor as the full-size primary image, so screen
+        # coordinates map directly to the 640 x 512 temperature grid.
+        self._updating_sources = True
+        self.main_source_combo.setCurrentText("Video 1")
+        self.view_combo.setCurrentText("Thermal + Zoom")
+        self._updating_sources = False
+        self.thermal_result_label.setText("Temperature: click or drag on video")
+        self.run_command(
+            "thermal measurement view",
+            lambda: self.client.set_image_mode("single_thermal_sub_zoom"),
+        )
+        if self.main_thread:
+            QTimer.singleShot(350, self.start_streams)
+
+    def _temperature_point_worker(self, x: int, y: int):
+        try:
+            result = self.client.request_temperature_point(x, y)
+            if not result:
+                raise RuntimeError("no response from camera")
+            ax, ay = self._thermal_to_ai(result["x"], result["y"])
+            self.thermal_result_signal.emit({
+                "kind": "point",
+                "x": ax,
+                "y": ay,
+                "temperature_c": result["temperature_c"],
+            })
+        except Exception as exc:
+            self.log_message(f"point temperature: ERROR {exc}")
+            self.thermal_result_signal.emit({"kind": "error", "message": str(exc)})
+
+    def _temperature_box_worker(self, left: int, top: int, right: int, bottom: int):
+        try:
+            sx, sy = self._ai_to_thermal(left, top)
+            ex, ey = self._ai_to_thermal(right, bottom)
+            result = self.client.request_temperature_box(sx, sy, ex, ey)
+            if not result:
+                raise RuntimeError("no response from camera")
+            box_left, box_top = self._thermal_to_ai(result["startx"], result["starty"])
+            box_right, box_bottom = self._thermal_to_ai(result["endx"], result["endy"])
+            max_x, max_y = self._thermal_to_ai(result["temp_max_x"], result["temp_max_y"])
+            min_x, min_y = self._thermal_to_ai(result["temp_min_x"], result["temp_min_y"])
+            self.thermal_result_signal.emit({
+                "kind": "box",
+                "box": (box_left, box_top, box_right, box_bottom),
+                "max_c": result["temp_max_c"],
+                "min_c": result["temp_min_c"],
+                "max_x": max_x,
+                "max_y": max_y,
+                "min_x": min_x,
+                "min_y": min_y,
+            })
+        except Exception as exc:
+            self.log_message(f"box temperature: ERROR {exc}")
+            self.thermal_result_signal.emit({"kind": "error", "message": str(exc)})
+
+    def _apply_thermal_result(self, result):
+        if result.get("kind") == "error":
+            self.thermal_result_label.setText(f'Temperature: ERROR — {result["message"]}')
+            return
+        self.video_stage.set_thermal_measurement(result)
+        if result["kind"] == "point":
+            self.thermal_result_label.setText(f'Temperature: {result["temperature_c"]:.1f} °C')
+        else:
+            self.thermal_result_label.setText(
+                f'Temperature area: MIN {result["min_c"]:.1f} °C  |  MAX {result["max_c"]:.1f} °C'
+            )
+
+    def clear_screen_tool(self):
+        if self.thermal_tool_enabled:
+            self.video_stage.set_thermal_measurement(None)
+            self.thermal_result_label.setText("Temperature: click or drag on video")
+        else:
+            self.cancel_ai_tracking()
 
     def track_ai_point(self, x: int, y: int):
         overlay_enabled = self.ai_overlay_check.isChecked()
@@ -1835,6 +2011,14 @@ class ZT30QtDashboard(QMainWindow):
         return {"recognition": recognition, "track_result": result, "x": x, "y": y}
 
     def track_ai_box(self, left: int, top: int, right: int, bottom: int):
+        if self.thermal_tool_enabled:
+            self.thermal_result_label.setText("Temperature area: reading...")
+            threading.Thread(
+                target=self._temperature_box_worker,
+                args=(left, top, right, bottom),
+                daemon=True,
+            ).start()
+            return
         self.last_selected_ai_box = None
         self.ai_tracking_signal.emit(None)
         self.ai_status_signal.emit(f"AI: ROI sent | {left},{top} - {right},{bottom}")
@@ -1960,6 +2144,85 @@ class ZT30QtDashboard(QMainWindow):
         except Exception as exc:
             self.log_message(f"{label}: ERROR {exc}")
 
+    def toggle_record(self):
+        if self.record_command_pending:
+            return
+        if not self._ensure_client():
+            self.log_message("record: not connected")
+            return
+
+        self.record_command_pending = True
+        self.record_button.setEnabled(False)
+        self.record_indicator.setText("● CHECKING RECORD STATUS")
+        threading.Thread(target=self._toggle_record_worker, daemon=True).start()
+
+    def _toggle_record_worker(self):
+        action = "stop" if self.recording else "start"
+        try:
+            before = self.client.request_config()
+            before_status = before.get("record") if before else None
+            if before_status in ("on", "off"):
+                action = "stop" if before_status == "on" else "start"
+
+            self.client.toggle_record()
+
+            # Recording state is not instantaneous and CMD 0x0C has no ACK.
+            # Confirm the result from camera config instead of assuming success.
+            last_status = None
+            for _ in range(5):
+                time.sleep(0.35)
+                config = self.client.request_config()
+                last_status = config.get("record") if config else None
+                expected = "off" if action == "stop" else "on"
+                if last_status == expected:
+                    self.log_message(f"record {action}: confirmed")
+                    self.record_status_signal.emit(last_status)
+                    return
+                if last_status in ("tf_empty", "tf_data_loss"):
+                    break
+
+            if last_status in ("tf_empty", "tf_data_loss"):
+                self.log_message(f"record {action}: camera reports {last_status}")
+                self.record_status_signal.emit(last_status)
+            else:
+                self.log_message(f"record {action}: not confirmed (status={last_status or 'timeout'})")
+                self.record_status_signal.emit("unknown")
+        except Exception as exc:
+            self.log_message(f"record {action}: ERROR {exc}")
+            self.record_status_signal.emit("error")
+
+    def _apply_record_status(self, status: str):
+        self.record_command_pending = False
+        self.record_button.setEnabled(True)
+
+        if status == "on":
+            self.recording = True
+            self.record_button.setText("Stop Record")
+            self.record_indicator.setText("● RECORDING")
+            self.record_indicator.setProperty("recording", True)
+        elif status == "off":
+            self.recording = False
+            self.record_button.setText("Start Record")
+            self.record_indicator.setText("● NOT RECORDING")
+            self.record_indicator.setProperty("recording", False)
+        elif status == "tf_empty":
+            self.recording = False
+            self.record_button.setText("Start Record")
+            self.record_indicator.setText("● TF CARD NOT AVAILABLE")
+            self.record_indicator.setProperty("recording", False)
+        elif status == "tf_data_loss":
+            self.recording = False
+            self.record_button.setText("Start Record")
+            self.record_indicator.setText("● TF CARD DATA ERROR")
+            self.record_indicator.setProperty("recording", False)
+        else:
+            self.record_indicator.setText("● RECORD STATUS UNKNOWN")
+            self.record_indicator.setProperty("recording", False)
+
+        # Dynamic Qt properties require an explicit style refresh.
+        self.record_indicator.style().unpolish(self.record_indicator)
+        self.record_indicator.style().polish(self.record_indicator)
+
     def rotate(self, yaw: int, pitch: int):
         self.run_command("move", lambda: self.client.rotate_speed(yaw, pitch))
 
@@ -2011,18 +2274,26 @@ class ZT30QtDashboard(QMainWindow):
         self.run_command("thermal palette", lambda: self.client.set_thermal_palette(palette))
 
     def refresh_status(self):
+        if self.status_refresh_pending:
+            return
         if not self._ensure_client():
             return
 
+        self.status_refresh_pending = True
         threading.Thread(target=self._refresh_worker, daemon=True).start()
 
     def _refresh_worker(self):
         try:
             attitude = self.client.request_attitude()
             zoom = self.client.request_zoom()
+            config = self.client.request_config()
             self.telemetry_signal.emit(attitude, zoom)
+            if config and not self.record_command_pending:
+                self.record_status_signal.emit(str(config.get("record", "unknown")))
         except Exception as exc:
             self.log_message(f"status: ERROR {exc}")
+        finally:
+            self.status_refresh_pending = False
 
     def _apply_telemetry(self, attitude, zoom):
         if attitude:
@@ -2311,6 +2582,30 @@ class ZT30QtDashboard(QMainWindow):
                 background: #58f7e8;
                 border-radius: 5px;
                 padding: 5px 9px;
+                font-weight: 900;
+            }
+
+            #recordIndicator {
+                color: #8fa3a3;
+                background: rgba(6, 9, 10, 175);
+                border: 1px solid rgba(98, 122, 122, 112);
+                border-radius: 5px;
+                padding: 7px 9px;
+                font-weight: 900;
+            }
+
+            #recordIndicator[recording="true"] {
+                color: #ffffff;
+                background: #c62828;
+                border-color: #ff8a80;
+            }
+
+            #thermalResult {
+                color: #ffffff;
+                background: rgba(10, 35, 38, 220);
+                border: 1px solid #40c4ff;
+                border-radius: 5px;
+                padding: 8px 10px;
                 font-weight: 900;
             }
 
