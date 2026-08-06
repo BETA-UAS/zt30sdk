@@ -796,6 +796,8 @@ class ZT30QtDashboard(QMainWindow):
         self.laser_refresh_pending = False
         self.video_render_pending = False
         self.thermal_tool_enabled = False
+        self.pre_thermal_source = None
+        self.pre_thermal_view = None
 
         self._build_ui()
         self._apply_style()
@@ -1922,10 +1924,22 @@ class ZT30QtDashboard(QMainWindow):
         self.video_stage.main_label.setCursor(Qt.CrossCursor if enabled else Qt.ArrowCursor)
         if not enabled:
             self.thermal_result_label.setText("Temperature: tool off")
+            restore_source = self.pre_thermal_source or "AI Camera"
+            restore_view = self.pre_thermal_view or "Zoom + Thermal"
+            self._updating_sources = True
+            self.main_source_combo.setCurrentText(restore_source)
+            self.view_combo.setCurrentText(restore_view)
+            self._updating_sources = False
+            mode = CAMERA_VIEWS.get(restore_view, "single_zoom_sub_thermal")
+            self.run_command("restore camera view", lambda: self._set_image_mode_verified(mode))
+            if self.main_thread:
+                QTimer.singleShot(350, self.start_streams)
             return
 
         # Use the thermal sensor as the full-size primary image, so screen
         # coordinates map directly to the 640 x 512 temperature grid.
+        self.pre_thermal_source = self.main_source_combo.currentText()
+        self.pre_thermal_view = self.view_combo.currentText()
         self._updating_sources = True
         self.main_source_combo.setCurrentText("Video 1")
         self.view_combo.setCurrentText("Thermal + Zoom")
@@ -1933,10 +1947,20 @@ class ZT30QtDashboard(QMainWindow):
         self.thermal_result_label.setText("Temperature: click or drag on video")
         self.run_command(
             "thermal measurement view",
-            lambda: self.client.set_image_mode("single_thermal_sub_zoom"),
+            lambda: self._set_image_mode_verified("single_thermal_sub_zoom"),
         )
         if self.main_thread:
             QTimer.singleShot(350, self.start_streams)
+
+    def _set_image_mode_verified(self, mode: str):
+        last_status = None
+        for _ in range(3):
+            self.client.set_image_mode(mode)
+            time.sleep(0.20)
+            last_status = self.client.request_image_mode()
+            if last_status == mode:
+                return last_status
+        raise RuntimeError(f"camera view did not change to {mode} (status={last_status})")
 
     def _temperature_point_worker(self, x: int, y: int):
         try:
@@ -2159,33 +2183,22 @@ class ZT30QtDashboard(QMainWindow):
     def _toggle_record_worker(self):
         action = "stop" if self.recording else "start"
         try:
-            before = self.client.request_config()
-            before_status = before.get("record") if before else None
-            if before_status in ("on", "off"):
-                action = "stop" if before_status == "on" else "start"
+            feedback = self.client.toggle_record()
+            if not feedback:
+                raise RuntimeError("no recording feedback from camera")
+            if feedback["info_type"] == 4:
+                self.log_message("record: camera rejected recording")
+                self.record_status_signal.emit("tf_empty")
+                return
 
-            self.client.toggle_record()
-
-            # Recording state is not instantaneous and CMD 0x0C has no ACK.
-            # Confirm the result from camera config instead of assuming success.
-            last_status = None
-            for _ in range(5):
-                time.sleep(0.35)
-                config = self.client.request_config()
-                last_status = config.get("record") if config else None
-                expected = "off" if action == "stop" else "on"
-                if last_status == expected:
-                    self.log_message(f"record {action}: confirmed")
-                    self.record_status_signal.emit(last_status)
-                    return
-                if last_status in ("tf_empty", "tf_data_loss"):
-                    break
-
-            if last_status in ("tf_empty", "tf_data_loss"):
-                self.log_message(f"record {action}: camera reports {last_status}")
-                self.record_status_signal.emit(last_status)
+            self.log_message(f"record {action}: camera feedback {feedback['info_type']}")
+            if action == "start" and feedback["info_type"] == 5:
+                self.record_status_signal.emit("on")
+            elif action == "stop" and feedback["info_type"] == 6:
+                self.record_status_signal.emit("off")
             else:
-                self.log_message(f"record {action}: not confirmed (status={last_status or 'timeout'})")
+                # Do not show a false stopped state. Firmware v0.2.8 on the
+                # tested device returned 5 again for a requested stop.
                 self.record_status_signal.emit("unknown")
         except Exception as exc:
             self.log_message(f"record {action}: ERROR {exc}")
@@ -2286,10 +2299,7 @@ class ZT30QtDashboard(QMainWindow):
         try:
             attitude = self.client.request_attitude()
             zoom = self.client.request_zoom()
-            config = self.client.request_config()
             self.telemetry_signal.emit(attitude, zoom)
-            if config and not self.record_command_pending:
-                self.record_status_signal.emit(str(config.get("record", "unknown")))
         except Exception as exc:
             self.log_message(f"status: ERROR {exc}")
         finally:

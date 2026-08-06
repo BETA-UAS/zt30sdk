@@ -63,7 +63,14 @@ class ZT30UDPClient:
         self.seq = (self.seq + 1) & 0xFFFF
         return value
 
-    def send(self, cmd_id: int, payload: bytes = b"", wait_response: bool = True, need_ack: bool = True) -> Optional[SiyiPacket]:
+    def send(
+        self,
+        cmd_id: int,
+        payload: bytes = b"",
+        wait_response: bool = True,
+        need_ack: bool = True,
+        response_cmd_id: Optional[int] = None,
+    ) -> Optional[SiyiPacket]:
         with self._io_lock:
             seq = self._next_seq()
             packet = build_packet(cmd_id, payload, seq=seq, need_ack=need_ack)
@@ -88,12 +95,12 @@ class ZT30UDPClient:
                     self.sock.settimeout(self.timeout)
 
                 response = parse_packet(raw, validate_crc=self.validate_crc)
-                if response.cmd_id != cmd_id:
+                expected_cmd_id = cmd_id if response_cmd_id is None else response_cmd_id
+                if response.cmd_id != expected_cmd_id:
                     continue
-                # Current SIYI firmware echoes the request sequence. Retain
-                # compatibility with firmware that returns sequence zero.
-                if response.seq not in (seq, 0):
-                    continue
+                # ZT30 firmware maintains its own response sequence counter;
+                # it does not echo the request sequence. CMD_ID is the stable
+                # correlation key for this request/response protocol.
                 return response
 
     def send_raw_hex(self, hex_string: str, wait_response: bool = True) -> Optional[SiyiPacket]:
@@ -159,7 +166,15 @@ class ZT30UDPClient:
         pkt = self.send(0x0B)
         if not pkt or len(pkt.payload) < 1:
             return None
-        mapping = {0: "success", 1: "fail_photo_check_tf", 2: "hdr_on", 3: "hdr_off", 4: "fail_record_check_tf"}
+        mapping = {
+            0: "photo_success",
+            1: "fail_photo_check_tf",
+            2: "hdr_on",
+            3: "hdr_off",
+            4: "fail_record_check_tf",
+            5: "recording_started",
+            6: "recording_stopped",
+        }
         return {"info_type": pkt.payload[0], "message": mapping.get(pkt.payload[0], "unknown")}
 
     # Gimbal movement
@@ -287,8 +302,23 @@ class ZT30UDPClient:
     def take_photo(self) -> None:
         self.camera_function("photo", wait_response=False)
 
-    def toggle_record(self) -> None:
-        self.camera_function("record_toggle", wait_response=False)
+    def toggle_record(self) -> Optional[Dict[str, Any]]:
+        pkt = self.send(
+            0x0C,
+            struct.pack("<B", PHOTO_RECORD_FUNC["record_toggle"]),
+            wait_response=True,
+            need_ack=False,
+            response_cmd_id=0x0B,
+        )
+        if not pkt or not pkt.payload:
+            return None
+        info_type = pkt.payload[0]
+        mapping = {
+            4: "fail_record_check_tf",
+            5: "recording_started",
+            6: "recording_stopped",
+        }
+        return {"info_type": info_type, "message": mapping.get(info_type, f"feedback_{info_type}")}
 
     def set_motion_mode(self, mode: str) -> None:
         mode = mode.lower().strip()
