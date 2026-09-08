@@ -4,10 +4,10 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BUILD_DIR="${ROOT_DIR}/build-appimage"
 VENV_DIR="${BUILD_DIR}/venv"
-APPDIR="${BUILD_DIR}/ZT30Control.AppDir"
-APP_NAME="ZT30 Control"
-APP_ID="zt30-control"
-APPIMAGE_OUT="${ROOT_DIR}/ZT30Control.AppImage"
+APPDIR="${BUILD_DIR}/MT11Control.AppDir"
+APP_NAME="MT11Control"
+APP_ID="mt11-control"
+APPIMAGE_OUT="${ROOT_DIR}/MT11Control.AppImage"
 
 echo "[appimage] Building ${APP_NAME}"
 
@@ -33,17 +33,17 @@ echo "[appimage] Running PyInstaller"
 "${VENV_DIR}/bin/pyinstaller" \
   --noconfirm \
   --clean \
-  --name ZT30Control \
+  --name MT11Control \
   --windowed \
   --paths "${ROOT_DIR}" \
-  --collect-submodules siyi_zt30 \
+  --collect-submodules mt11_sdk \
   --hidden-import json \
   --hidden-import urllib.request \
   --hidden-import urllib.parse \
-  "${ROOT_DIR}/ui/zt30_dashboard_qt.py"
+  "${ROOT_DIR}/ui/mt11_dashboard_qt.py"
 
 mkdir -p "${APPDIR}/usr/bin" "${APPDIR}/usr/share/applications" "${APPDIR}/usr/share/icons/hicolor/256x256/apps"
-cp -a "${ROOT_DIR}/dist/ZT30Control/." "${APPDIR}/usr/bin/ZT30Control/"
+cp -a "${ROOT_DIR}/dist/MT11Control/." "${APPDIR}/usr/bin/MT11Control/"
 
 if command -v ffmpeg >/dev/null 2>&1; then
   cp "$(command -v ffmpeg)" "${APPDIR}/usr/bin/ffmpeg" || true
@@ -57,8 +57,8 @@ unset PYTHONHOME
 unset PYTHONPATH
 export PYTHONNOUSERSITE=1
 export PATH="${HERE}/usr/bin:${PATH}"
-export QT_QPA_PLATFORM_PLUGIN_PATH="${HERE}/usr/bin/ZT30Control/_internal/PyQt5/Qt5/plugins:${QT_QPA_PLATFORM_PLUGIN_PATH:-}"
-exec "${HERE}/usr/bin/ZT30Control/ZT30Control" "$@"
+export QT_QPA_PLATFORM_PLUGIN_PATH="${HERE}/usr/bin/MT11Control/_internal/PyQt5/Qt5/plugins:${QT_QPA_PLATFORM_PLUGIN_PATH:-}"
+exec "${HERE}/usr/bin/MT11Control/MT11Control" "$@"
 EOF
 chmod +x "${APPDIR}/AppRun"
 
@@ -86,7 +86,7 @@ for target in [
     d.rounded_rectangle((18, 18, 238, 238), radius=34, fill=(6, 10, 11, 255), outline=(88, 247, 232, 255), width=6)
     d.rectangle((52, 76, 204, 164), fill=(0, 0, 0, 255), outline=(242, 242, 239, 255), width=4)
     d.line((72, 194, 184, 194), fill=(88, 247, 232, 255), width=8)
-    d.text((70, 96), "ZT30", fill=(242, 242, 239, 255))
+    d.text((70, 96), "MT11", fill=(242, 242, 239, 255))
     img.save(target)
 PY
 

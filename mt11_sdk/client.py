@@ -1,4 +1,4 @@
-"""High level UDP client for SIYI ZT30 gimbal camera."""
+"""High level UDP client for UniPod MT11 gimbal camera."""
 
 from __future__ import annotations
 
@@ -14,13 +14,14 @@ from .constants import (
     DEFAULT_PORT,
     IMAGE_MODE_BY_NAME,
     IMAGE_MODES,
+    MT11_STREAM_NAMES,
     PHOTO_RECORD_FUNC,
     STREAM_TYPE_BY_NAME,
     THERMAL_PALETTE_BY_NAME,
     THERMAL_PALETTES,
     VIDEO_ENCODER_BY_NAME,
 )
-from .protocol import SiyiPacket, build_packet, hexdump, parse_packet
+from .protocol import MT11Packet, build_packet, hexdump, parse_packet
 
 
 @dataclass
@@ -33,12 +34,12 @@ class CodecSpec:
     frame_rate: Optional[int] = None
 
 
-class ZT30UDPClient:
+class MT11UDPClient:
     """
-    SIYI ZT30 UDP SDK client.
+    UniPod MT11 UDP SDK client.
 
-    This class implements the commands documented in the ZT30 User Manual v1.3,
-    chapter 3.5 UART / UDP Control.
+    This class implements the commands documented in the UniPod MT11 External
+    SDK Protocol Specification.
     """
 
     def __init__(self, host: str = DEFAULT_IP, port: int = DEFAULT_PORT, timeout: float = 0.5, validate_crc: bool = True):
@@ -70,7 +71,7 @@ class ZT30UDPClient:
         wait_response: bool = True,
         need_ack: bool = True,
         response_cmd_id: Optional[int] = None,
-    ) -> Optional[SiyiPacket]:
+    ) -> Optional[MT11Packet]:
         with self._io_lock:
             seq = self._next_seq()
             packet = build_packet(cmd_id, payload, seq=seq, need_ack=need_ack)
@@ -98,12 +99,12 @@ class ZT30UDPClient:
                 expected_cmd_id = cmd_id if response_cmd_id is None else response_cmd_id
                 if response.cmd_id != expected_cmd_id:
                     continue
-                # ZT30 firmware maintains its own response sequence counter;
+                # MT11 firmware maintains its own response sequence counter;
                 # it does not echo the request sequence. CMD_ID is the stable
                 # correlation key for this request/response protocol.
                 return response
 
-    def send_raw_hex(self, hex_string: str, wait_response: bool = True) -> Optional[SiyiPacket]:
+    def send_raw_hex(self, hex_string: str, wait_response: bool = True) -> Optional[MT11Packet]:
         with self._io_lock:
             raw = bytes.fromhex(hex_string)
             self.sock.sendto(raw, (self.host, self.port))
@@ -119,13 +120,14 @@ class ZT30UDPClient:
 
     def request_firmware_version(self) -> Optional[Dict[str, str]]:
         pkt = self.send(0x01)
-        if not pkt:
+        if not pkt or len(pkt.payload) < 8:
             return None
-        values = struct.unpack("<III", pkt.payload[:12])
+        payload = pkt.payload[:12].ljust(12, b"\x00")
+        values = struct.unpack("<III", payload)
         return {
             "camera": self._decode_firmware(values[0]),
             "gimbal": self._decode_firmware(values[1]),
-            "zoom": self._decode_firmware(values[2]),
+            "zoom": None,
             "raw": values,
         }
 
@@ -160,6 +162,8 @@ class ZT30UDPClient:
                 "mounting": {0: "reserved", 1: "normal", 2: "upside_down"}.get(p[5], p[5]),
                 "video_output": p[6],
             })
+        if len(p) >= 8:
+            result["zoom_linkage"] = {0: "off", 1: "on"}.get(p[7], p[7])
         return result
 
     def request_function_feedback(self) -> Optional[Dict[str, Any]]:
@@ -286,7 +290,7 @@ class ZT30UDPClient:
 
     # Photo, record, modes
 
-    def camera_function(self, func: int | str, wait_response: bool = False) -> Optional[SiyiPacket]:
+    def camera_function(self, func: int | str, wait_response: bool = False) -> Optional[MT11Packet]:
         if isinstance(func, str):
             func_id = PHOTO_RECORD_FUNC[func]
         else:
@@ -347,16 +351,21 @@ class ZT30UDPClient:
 
     def request_image_mode(self) -> Optional[str]:
         pkt = self.send(0x10)
-        if not pkt or len(pkt.payload) < 1:
+        if not pkt or len(pkt.payload) < 2:
             return None
-        return IMAGE_MODES.get(pkt.payload[0], f"unknown_{pkt.payload[0]}")
+        mode = (pkt.payload[0], pkt.payload[1])
+        return IMAGE_MODES.get(mode, f"{MT11_STREAM_NAMES.get(mode[0], mode[0])}_sub_{MT11_STREAM_NAMES.get(mode[1], mode[1])}")
 
-    def set_image_mode(self, mode: int | str) -> Optional[str]:
-        mode_id = IMAGE_MODE_BY_NAME.get(mode, mode) if isinstance(mode, str) else int(mode)
-        pkt = self.send(0x11, struct.pack("<B", mode_id))
-        if not pkt or len(pkt.payload) < 1:
+    def set_image_mode(self, mode: tuple[int, int] | str) -> Optional[str]:
+        if isinstance(mode, str):
+            mode_pair = IMAGE_MODE_BY_NAME[mode]
+        else:
+            mode_pair = (int(mode[0]), int(mode[1]))
+        pkt = self.send(0x11, struct.pack("<BB", mode_pair[0], mode_pair[1]))
+        if not pkt or len(pkt.payload) < 2:
             return None
-        return IMAGE_MODES.get(pkt.payload[0], f"unknown_{pkt.payload[0]}")
+        response = (pkt.payload[0], pkt.payload[1])
+        return IMAGE_MODES.get(response, f"{MT11_STREAM_NAMES.get(response[0], response[0])}_sub_{MT11_STREAM_NAMES.get(response[1], response[1])}")
 
     # Thermal functions
 
@@ -402,17 +411,6 @@ class ZT30UDPClient:
             return None
         return THERMAL_PALETTES.get(pkt.payload[0], f"unknown_{pkt.payload[0]}")
 
-    def set_thermal_raw_mode(self, mode: int) -> Optional[int]:
-        # 0: 30 fps, 1: 25 fps and output temperature frame
-        pkt = self.send(0x34, struct.pack("<B", int(mode)))
-        if not pkt or len(pkt.payload) < 1:
-            return None
-        return pkt.payload[0]
-
-    def request_temperature_once(self) -> Optional[bool]:
-        pkt = self.send(0x35)
-        return self._ack_success(pkt)
-
     def request_thermal_gain(self) -> Optional[str]:
         pkt = self.send(0x37)
         if not pkt or len(pkt.payload) < 1:
@@ -424,38 +422,6 @@ class ZT30UDPClient:
         if not pkt or len(pkt.payload) < 1:
             return None
         return "high" if pkt.payload[0] == 1 else "low"
-
-    def request_thermal_calibration(self) -> Optional[bool]:
-        pkt = self.send(0x39)
-        if not pkt or len(pkt.payload) < 1:
-            return None
-        # Manual: 0 ON, 1 OFF
-        return pkt.payload[0] == 0
-
-    def set_thermal_calibration(self, enable: bool) -> Optional[bool]:
-        pkt = self.send(0x3A, struct.pack("<B", 0 if enable else 1))
-        if not pkt or len(pkt.payload) < 1:
-            return None
-        return pkt.payload[0] == 0
-
-    def request_thermal_calibration_params(self) -> Optional[Dict[str, float]]:
-        pkt = self.send(0x3B)
-        if not pkt or len(pkt.payload) < 10:
-            return None
-        dist, ems, hum, ta, tu = struct.unpack("<HHHHH", pkt.payload[:10])
-        return {"distance_m": dist / 100.0, "emissivity_pct": ems / 100.0, "humidity_pct": hum / 100.0, "atmospheric_temp_c": ta / 100.0, "reflection_temp_c": tu / 100.0}
-
-    def set_thermal_calibration_params(self, distance_m: float, emissivity_pct: float, humidity_pct: float, atmospheric_temp_c: float, reflection_temp_c: float) -> Optional[bool]:
-        payload = struct.pack(
-            "<HHHHH",
-            int(round(distance_m * 100)),
-            int(round(emissivity_pct * 100)),
-            int(round(humidity_pct * 100)),
-            int(round(atmospheric_temp_c * 100)),
-            int(round(reflection_temp_c * 100)),
-        )
-        pkt = self.send(0x3C, payload)
-        return self._ack_success(pkt)
 
     # Laser rangefinder
 
@@ -485,8 +451,10 @@ class ZT30UDPClient:
 
     # Flight controller integration and streams
 
-    def send_flight_controller_attitude(self, roll: float, pitch: float, yaw: float, rollspeed: float = 0.0, pitchspeed: float = 0.0, yawspeed: float = 0.0) -> Optional[SiyiPacket]:
-        payload = struct.pack("<ffffff", float(roll), float(pitch), float(yaw), float(rollspeed), float(pitchspeed), float(yawspeed))
+    def send_flight_controller_attitude(self, roll: float, pitch: float, yaw: float, rollspeed: float = 0.0, pitchspeed: float = 0.0, yawspeed: float = 0.0, time_boot_ms: Optional[int] = None) -> Optional[MT11Packet]:
+        if time_boot_ms is None:
+            time_boot_ms = int(time.monotonic() * 1000)
+        payload = struct.pack("<Iffffff", int(time_boot_ms), float(roll), float(pitch), float(yaw), float(rollspeed), float(pitchspeed), float(yawspeed))
         return self.send(0x22, payload)
 
     def request_fc_data_stream_to_gimbal(self, data_type: int = 1, data_freq: int = 4) -> Optional[int]:
@@ -495,8 +463,18 @@ class ZT30UDPClient:
             return None
         return pkt.payload[0]
 
-    def send_flight_controller_gps(self, time_boot_ms: int, lat_deg_e7: int, lon_deg_e7: int, alt_cm: int, alt_ellipsoid_cm: int, vn: float, ve: float, vd: float) -> Optional[SiyiPacket]:
-        payload = struct.pack("<IiIiIfff", int(time_boot_ms), int(lat_deg_e7), int(lon_deg_e7), int(alt_cm), int(alt_ellipsoid_cm), float(vn), float(ve), float(vd))
+    def send_flight_controller_gps(self, time_boot_ms: int, lat_deg_e7: int, lon_deg_e7: int, alt_cm: int, alt_ellipsoid_cm: int, vn_mps: float, ve_mps: float, vd_mps: float) -> Optional[MT11Packet]:
+        payload = struct.pack(
+            "<Iiiiiiii",
+            int(time_boot_ms),
+            int(lat_deg_e7),
+            int(lon_deg_e7),
+            int(alt_cm),
+            int(alt_ellipsoid_cm),
+            int(round(vn_mps * 1000)),
+            int(round(ve_mps * 1000)),
+            int(round(vd_mps * 1000)),
+        )
         return self.send(0x3E, payload)
 
     def request_gimbal_data_stream(self, data_type: int = 1, data_freq: int = 4) -> Optional[int]:
@@ -513,9 +491,56 @@ class ZT30UDPClient:
         pkt = self.send(0x30, struct.pack("<Q", int(timestamp_us)))
         return self._ack_success(pkt)
 
+    def request_system_time(self) -> Optional[Dict[str, int]]:
+        pkt = self.send(0x40)
+        if not pkt or len(pkt.payload) < 12:
+            return None
+        unix_us, boot_ms = struct.unpack("<QI", pkt.payload[:12])
+        return {"unix_us": unix_us, "boot_ms": boot_ms}
+
     def format_sd_card(self) -> Optional[bool]:
         pkt = self.send(0x48)
         return self._ack_success(pkt)
+
+    def request_tf_card_info(self) -> Optional[Dict[str, Any]]:
+        pkt = self.send(0x49)
+        if not pkt or len(pkt.payload) < 6:
+            return None
+        status, fs, total, available = struct.unpack("<BBHH", pkt.payload[:6])
+        return {
+            "status": status,
+            "file_system": fs,
+            "total_gb": total / 100.0,
+            "available_gb": available / 100.0,
+        }
+
+    def manual_thermal_shutter(self) -> Optional[bool]:
+        pkt = self.send(0x4F)
+        return self._ack_success(pkt)
+
+    def get_defog_mode(self) -> Optional[int]:
+        pkt = self.send(0x62, b"")
+        if not pkt or len(pkt.payload) < 1:
+            return None
+        return pkt.payload[0]
+
+    def set_defog_mode(self, mode: int) -> Optional[int]:
+        pkt = self.send(0x62, struct.pack("<B", int(mode)))
+        if not pkt or len(pkt.payload) < 1:
+            return None
+        return pkt.payload[0]
+
+    def get_night_vision(self) -> Optional[bool]:
+        pkt = self.send(0x63, b"")
+        if not pkt or len(pkt.payload) < 1:
+            return None
+        return pkt.payload[0] == 1
+
+    def set_night_vision(self, enabled: bool) -> Optional[bool]:
+        pkt = self.send(0x63, struct.pack("<B", 1 if enabled else 0))
+        if not pkt or len(pkt.payload) < 1:
+            return None
+        return pkt.payload[0] == 1
 
     def soft_restart(self, camera: bool = False, gimbal: bool = False) -> Optional[Dict[str, bool]]:
         pkt = self.send(0x80, struct.pack("<BB", 1 if camera else 0, 1 if gimbal else 0))
@@ -524,7 +549,7 @@ class ZT30UDPClient:
         return {"camera_restart": pkt.payload[0] == 1, "gimbal_restart": pkt.payload[1] == 1}
 
     @staticmethod
-    def _ack_success(pkt: Optional[SiyiPacket]) -> Optional[bool]:
+    def _ack_success(pkt: Optional[MT11Packet]) -> Optional[bool]:
         if pkt is None:
             return None
         if len(pkt.payload) < 1:
@@ -532,7 +557,7 @@ class ZT30UDPClient:
         return pkt.payload[0] == 1
 
     @staticmethod
-    def hexdump(packet: Optional[SiyiPacket | bytes]) -> str:
-        if isinstance(packet, SiyiPacket):
+    def hexdump(packet: Optional[MT11Packet | bytes]) -> str:
+        if isinstance(packet, MT11Packet):
             return hexdump(packet.raw)
         return hexdump(packet)

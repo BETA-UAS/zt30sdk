@@ -1,4 +1,4 @@
-"""Client for SIYI AI Tracking Module II."""
+"""Client for UniPod MT11 built-in AI tracking."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ import time
 from typing import Callable, Optional
 
 from .constants import DEFAULT_AI_IP, DEFAULT_PORT
-from .protocol import SiyiPacket, build_packet, parse_packets
+from .protocol import MT11Packet, build_packet, parse_packets
 
 
 AI_TARGET_TYPES = {
@@ -32,7 +32,7 @@ AI_TRACK_STATES = {
 
 @dataclass(frozen=True)
 class AITrackingBox:
-    """Tracking target rectangle reported by the AI module."""
+    """Tracking target rectangle reported by the MT11."""
 
     x: int
     y: int
@@ -66,12 +66,12 @@ class AITrackingBox:
         return int(self.y + self.height / 2)
 
 
-class SiyiAITrackingClient:
+class MT11AITrackingClient:
     """
-    SIYI AI Tracking Module II SDK client.
+    UniPod MT11 AI tracking client.
 
-    The documented AI SDK uses the same SIYI packet format as the ZT30 SDK,
-    but the module default address is 192.168.144.60:37260.
+    MT11 AI tracking is built into the gimbal camera and uses the same
+    192.168.144.25:37260 SDK endpoint as the rest of the camera controls.
     """
 
     def __init__(
@@ -91,6 +91,8 @@ class SiyiAITrackingClient:
         self._io_lock = threading.Lock()
         self._listen_thread: Optional[threading.Thread] = None
         self._listening = False
+        self.last_mode_error: Optional[int] = None
+        self.last_select_error: Optional[int] = None
 
     def close(self) -> None:
         self.stop_coordinate_listener()
@@ -111,7 +113,7 @@ class SiyiAITrackingClient:
         payload: bytes = b"",
         wait_response: bool = True,
         need_ack: bool = True,
-    ) -> Optional[SiyiPacket]:
+    ) -> Optional[MT11Packet]:
         with self._io_lock:
             packet = build_packet(cmd_id, payload, seq=self._next_seq(), need_ack=need_ack)
             self.sock.sendto(packet, (self.host, self.port))
@@ -146,79 +148,71 @@ class SiyiAITrackingClient:
         return f"v{(value >> 16) & 0xFF}.{(value >> 8) & 0xFF}.{value & 0xFF}"
 
     def get_recognition_enabled(self) -> Optional[bool]:
-        pkt = self.send(0x03)
+        pkt = self.send(0x4D)
         if not pkt or len(pkt.payload) < 1:
             return None
         return pkt.payload[0] == 1
 
     def set_recognition_enabled(self, enabled: bool) -> Optional[bool]:
-        pkt = self.send(0x04, struct.pack("<B", 1 if enabled else 0))
+        pkt = self.send(0x55, struct.pack("<B", 1 if enabled else 0))
         if not pkt or len(pkt.payload) < 1:
             return None
-        return pkt.payload[0] == 1
+        self.last_mode_error = pkt.payload[1] if len(pkt.payload) > 1 else None
+        return pkt.payload[0] == (1 if enabled else 0) and self.last_mode_error in (None, 0)
 
     def get_tracking_status(self) -> Optional[bool]:
-        pkt = self.send(0x05)
+        pkt = self.send(0x57)
         if not pkt or len(pkt.payload) < 1:
             return None
-        return pkt.payload[0] == 1
+        return pkt.payload[0] == 0
 
     def track_point(self, x: int, y: int) -> Optional[int]:
-        payload = struct.pack("<BHH", 1, self._clamp_u16(x), self._clamp_u16(y))
-        pkt = self.send(0x06, payload)
-        if not pkt or len(pkt.payload) < 1:
-            tracking = self.get_tracking_status()
-            return 1 if tracking else None
-        return pkt.payload[0]
+        payload = struct.pack("<BHHHH", 1, self._clamp_u16(x), self._clamp_u16(y), 0, 0)
+        pkt = self.send(0x56, payload)
+        return self._select_status(pkt)
 
     def track_box(self, left: int, top: int, right: int, bottom: int) -> Optional[int]:
         payload = struct.pack(
             "<BHHHH",
-            2,
+            1,
             self._clamp_u16(left),
             self._clamp_u16(top),
             self._clamp_u16(right),
             self._clamp_u16(bottom),
         )
-        self.send(0x06, payload, wait_response=False)
-        return 1
+        pkt = self.send(0x56, payload)
+        return self._select_status(pkt)
 
     def cancel_tracking(self) -> Optional[int]:
-        payload = struct.pack("<BHHHH", 3, 0, 0, 0, 0)
-        self.send(0x06, payload, wait_response=False)
-        return 1
+        pkt = self.send(0x56, struct.pack("<BHHHH", 0, 0, 0, 0, 0))
+        return self._select_status(pkt)
 
     def set_tracking_target(self, enabled: bool, lx: int, ly: int, rx: int, ry: int, action: int = 1) -> Optional[int]:
         payload = struct.pack(
             "<BHHHH",
-            action if enabled else 3,
+            action if enabled else 0,
             self._clamp_u16(lx),
             self._clamp_u16(ly),
             self._clamp_u16(rx),
             self._clamp_u16(ry),
         )
-        pkt = self.send(0x06, payload)
-        if not pkt or len(pkt.payload) < 1:
-            return None
-        return pkt.payload[0]
+        pkt = self.send(0x56, payload)
+        return self._select_status(pkt)
 
     def get_coordinate_stream_status(self) -> Optional[int]:
-        pkt = self.send(0x08)
+        pkt = self.send(0x4E)
         if not pkt or len(pkt.payload) < 1:
             return None
         return pkt.payload[0]
 
     def set_coordinate_stream_enabled(self, enabled: bool) -> Optional[bool]:
-        pkt = self.send(0x09, struct.pack("<B", 1 if enabled else 0))
+        pkt = self.send(0x51, struct.pack("<B", 1 if enabled else 0))
         if not pkt or len(pkt.payload) < 1:
             return None
-        return pkt.payload[0] == 1
+        return pkt.payload[0] == (1 if enabled else 0)
 
     def set_rtsp_stream_enabled(self, enabled: bool) -> Optional[bool]:
-        pkt = self.send(0x0B, struct.pack("<B", 1 if enabled else 0))
-        if not pkt or len(pkt.payload) < 1:
-            return None
-        return pkt.payload[0] == 1
+        return True
 
     def start_coordinate_listener(
         self,
@@ -263,7 +257,7 @@ class SiyiAITrackingClient:
                 finally:
                     self._io_lock.release()
                 for pkt in parse_packets(raw, validate_crc=self.validate_crc):
-                    if pkt.cmd_id == 0x0A:
+                    if pkt.cmd_id == 0x50:
                         box = self.parse_tracking_box(pkt.payload)
                         callback(box)
             except Exception as exc:
@@ -276,6 +270,12 @@ class SiyiAITrackingClient:
             raise ValueError(f"AI tracking payload too short: {len(payload)} bytes")
         x, y, width, height, target_id, track_state = struct.unpack("<HHHHBB", payload[:10])
         return AITrackingBox(x, y, width, height, target_id, track_state)
+
+    def _select_status(self, pkt: Optional[MT11Packet]) -> Optional[int]:
+        if not pkt or len(pkt.payload) < 1:
+            return None
+        self.last_select_error = pkt.payload[0]
+        return pkt.payload[0]
 
     @staticmethod
     def _clamp_u16(value: int) -> int:

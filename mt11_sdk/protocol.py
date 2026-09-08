@@ -1,5 +1,5 @@
 """
-SIYI ZT30 Gimbal SDK protocol helpers.
+UniPod MT11 gimbal camera SDK protocol helpers.
 
 Packet format:
   STX      2 bytes: 55 66
@@ -20,12 +20,12 @@ from typing import List, Optional
 STX = b"\x55\x66"
 
 
-class SiyiProtocolError(Exception):
-    """Raised when a SIYI SDK packet is malformed or fails CRC validation."""
+class MT11ProtocolError(Exception):
+    """Raised when an SDK packet is malformed or fails CRC validation."""
 
 
 @dataclass(frozen=True)
-class SiyiPacket:
+class MT11Packet:
     ctrl: int
     data_len: int
     seq: int
@@ -45,7 +45,7 @@ class SiyiPacket:
 
 def crc16_ccitt(data: bytes, crc_init: int = 0) -> int:
     """
-    CRC16 implementation compatible with the SIYI SDK examples.
+    CRC16 implementation compatible with the MT11 SDK examples.
     Polynomial: 0x1021
     Initial value: 0x0000
     Output is returned as integer. Pack it little endian in the frame.
@@ -76,16 +76,16 @@ def build_packet(cmd_id: int, payload: bytes = b"", seq: int = 0, need_ack: bool
     return body + struct.pack("<H", crc)
 
 
-def parse_packet(raw: bytes, validate_crc: bool = True) -> SiyiPacket:
+def parse_packet(raw: bytes, validate_crc: bool = True) -> MT11Packet:
     if len(raw) < 10:
-        raise SiyiProtocolError(f"Packet too short: {len(raw)} bytes")
+        raise MT11ProtocolError(f"Packet too short: {len(raw)} bytes")
     if raw[0:2] != STX:
-        raise SiyiProtocolError(f"Invalid STX: {raw[0:2].hex(' ')}")
+        raise MT11ProtocolError(f"Invalid STX: {raw[0:2].hex(' ')}")
 
     ctrl, data_len, seq, cmd_id = struct.unpack("<BHHB", raw[2:8])
     expected_len = 8 + data_len + 2
     if len(raw) < expected_len:
-        raise SiyiProtocolError(f"Incomplete packet: got {len(raw)}, expected {expected_len}")
+        raise MT11ProtocolError(f"Incomplete packet: got {len(raw)}, expected {expected_len}")
 
     raw = raw[:expected_len]
     payload = raw[8:8 + data_len]
@@ -94,13 +94,13 @@ def parse_packet(raw: bytes, validate_crc: bool = True) -> SiyiPacket:
     if validate_crc:
         crc_calc = crc16_ccitt(raw[:-2])
         if crc_rx != crc_calc:
-            raise SiyiProtocolError(f"CRC mismatch: rx=0x{crc_rx:04X}, calc=0x{crc_calc:04X}")
+            raise MT11ProtocolError(f"CRC mismatch: rx=0x{crc_rx:04X}, calc=0x{crc_calc:04X}")
 
-    return SiyiPacket(ctrl=ctrl, data_len=data_len, seq=seq, cmd_id=cmd_id, payload=payload, crc=crc_rx, raw=raw)
+    return MT11Packet(ctrl=ctrl, data_len=data_len, seq=seq, cmd_id=cmd_id, payload=payload, crc=crc_rx, raw=raw)
 
 
-def parse_packets(raw: bytes, validate_crc: bool = True) -> List[SiyiPacket]:
-    """Parse one or more SIYI packets from a single byte buffer."""
+def parse_packets(raw: bytes, validate_crc: bool = True) -> List[MT11Packet]:
+    """Parse one or more SDK packets from a single byte buffer."""
     packets = []
     offset = 0
 

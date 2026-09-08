@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VENV_DIR="${ROOT_DIR}/.venv"
 
-echo "[setup] SIYI ZT30 SDK package"
+echo "[setup] UniPod MT11 SDK package"
 
 if ! command -v python3 >/dev/null 2>&1; then
   echo "[setup] ERROR: python3 is required."
@@ -35,15 +35,16 @@ echo "[setup] Installing Python package and UI dependencies"
 "${VENV_DIR}/bin/python" -m pip install --upgrade pip setuptools wheel
 "${VENV_DIR}/bin/python" -m pip install -e "${ROOT_DIR}[ui]"
 
-cat > "${ROOT_DIR}/run_dashboard.sh" <<'EOF'
+cat > "${ROOT_DIR}/run_mt11control.sh" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-exec "${ROOT_DIR}/.venv/bin/python" "${ROOT_DIR}/ui/zt30_dashboard_qt.py" "$@"
+exec "${ROOT_DIR}/.venv/bin/python" "${ROOT_DIR}/ui/mt11_dashboard_qt.py" "$@"
 EOF
-chmod +x "${ROOT_DIR}/run_dashboard.sh"
+chmod +x "${ROOT_DIR}/run_mt11control.sh"
+ln -sf run_mt11control.sh "${ROOT_DIR}/run_dashboard.sh"
 
 echo
 echo "[setup] Done."
-echo "[setup] Run dashboard:"
-echo "        ${ROOT_DIR}/run_dashboard.sh"
+echo "[setup] Run MT11Control:"
+echo "        ${ROOT_DIR}/run_mt11control.sh"

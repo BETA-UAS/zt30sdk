@@ -4,15 +4,15 @@ from flask import Flask, Response, jsonify, request
 import requests
 from urllib.parse import urlparse
 
-ZT30_HOST = "192.168.144.25"
-ZT30_PORT = 82
-ZT30_BASE = f"http://{ZT30_HOST}:{ZT30_PORT}/cgi-bin/media.cgi//api/v1"
+MT11_HOST = "192.168.144.25"
+MT11_PORT = 82
+MT11_BASE = f"http://{MT11_HOST}:{MT11_PORT}/api/v1"
 
 app = Flask(__name__)
 
 
-def zt30_get(endpoint, params=None):
-    url = f"{ZT30_BASE}/{endpoint}"
+def mt11_get(endpoint, params=None):
+    url = f"{MT11_BASE}/{endpoint}"
     r = requests.get(url, params=params or {}, timeout=5)
     r.raise_for_status()
     return r.json()
@@ -34,7 +34,7 @@ def format_size(size_bytes):
 
 
 def get_remote_file_size(url):
-    if not is_allowed_zt30_url(url):
+    if not is_allowed_mt11_url(url):
         return None
 
     try:
@@ -50,7 +50,7 @@ def get_remote_file_size(url):
     return None
 
 
-def is_allowed_zt30_url(url):
+def is_allowed_mt11_url(url):
     try:
         parsed = urlparse(url)
     except Exception:
@@ -59,7 +59,7 @@ def is_allowed_zt30_url(url):
     if parsed.scheme not in ("http", "https"):
         return False
 
-    if parsed.hostname != ZT30_HOST:
+    if parsed.hostname != MT11_HOST:
         return False
 
     return True
@@ -72,7 +72,7 @@ def index():
 <html>
 <head>
   <meta charset="utf-8">
-  <title>ZT30 Media Browser</title>
+  <title>MT11 Media Browser</title>
   <style>
     body {
       font-family: Arial, sans-serif;
@@ -159,7 +159,7 @@ def index():
   </style>
 </head>
 <body>
-  <h1>ZT30 Media Browser</h1>
+  <h1>MT11 Media Browser</h1>
   <p>Camera: 192.168.144.25</p>
 
   <div class="topbar">
@@ -281,7 +281,7 @@ def api_directories():
     media_type = request.args.get("media_type", "0")
 
     try:
-        return jsonify(zt30_get("getdirectories", {"media_type": media_type}))
+        return jsonify(mt11_get("getdirectories", {"media_type": media_type}))
     except Exception as e:
         return jsonify({
             "success": False,
@@ -295,7 +295,7 @@ def api_count():
     path = request.args.get("path", "")
 
     try:
-        return jsonify(zt30_get("getmediacount", {
+        return jsonify(mt11_get("getmediacount", {
             "media_type": media_type,
             "path": path,
         }))
@@ -314,7 +314,7 @@ def api_list():
     count = request.args.get("count", "100")
 
     try:
-        data = zt30_get("getmedialist", {
+        data = mt11_get("getmedialist", {
             "media_type": media_type,
             "path": path,
             "start": start,
@@ -346,7 +346,7 @@ def api_filesize():
             "message": "Missing url",
         }), 400
 
-    if not is_allowed_zt30_url(url):
+    if not is_allowed_mt11_url(url):
         return jsonify({
             "success": False,
             "message": "URL is not allowed",
@@ -368,7 +368,7 @@ def proxy_media():
     if not url:
         return "Missing url", 400
 
-    if not is_allowed_zt30_url(url):
+    if not is_allowed_mt11_url(url):
         return "URL is not allowed", 400
 
     try:

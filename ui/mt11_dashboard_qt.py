@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Clean PyQt5 dashboard for SIYI ZT30 control and RTSP monitoring."""
+"""Clean PyQt5 dashboard for UniPod MT11 control and RTSP monitoring."""
 
 from __future__ import annotations
 
@@ -55,8 +55,8 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from siyi_zt30 import AITrackingBox, DEFAULT_AI_IP, DEFAULT_IP, DEFAULT_PORT, SiyiAITrackingClient, ZT30UDPClient, ZT30WebClient
-from siyi_zt30.constants import IMAGE_MODE_BY_NAME, IMAGE_MODES, THERMAL_PALETTES
+from mt11_sdk import AITrackingBox, DEFAULT_AI_IP, DEFAULT_IP, DEFAULT_PORT, MT11AITrackingClient, MT11UDPClient, MT11WebClient
+from mt11_sdk.constants import IMAGE_MODE_BY_NAME, IMAGE_MODES, THERMAL_PALETTES
 
 
 STREAM_SIZE = (960, 540)
@@ -68,15 +68,9 @@ AI_COORD_SIZE = (1280, 720)
 THERMAL_COORD_SIZE = (640, 512)
 
 CAMERA_VIEWS = {
-    "Zoom + Thermal": "single_zoom_sub_thermal",
-    "Zoom + Wide": "single_zoom_sub_wide",
-    "Wide + Thermal": "single_wide_sub_thermal",
-    "Wide + Zoom": "single_wide_sub_zoom",
-    "Thermal + Zoom": "single_thermal_sub_zoom",
-    "Thermal + Wide": "single_thermal_sub_wide",
-    "Split Zoom/Thermal": "split_zoom_thermal_sub_wide",
-    "Split Wide/Thermal": "split_wide_thermal_sub_zoom",
-    "Split Zoom/Wide": "split_zoom_wide_sub_thermal",
+    "Zoom + Thermal": "zoom_sub_thermal",
+    "Thermal + Zoom": "thermal_sub_zoom",
+    "Zoom/Thermal + Thermal": "zoom_thermal_sub_thermal",
 }
 
 THERMAL_NAMES = {
@@ -93,10 +87,6 @@ THERMAL_NAMES = {
 
 def rtsp_url(host: str, stream: int) -> str:
     return f"rtsp://{host}:8554/video{stream}"
-
-
-def ai_rtsp_url(host: str) -> str:
-    return f"rtsp://{host}:554/video0"
 
 
 def clamp(value: int, min_value: int, max_value: int) -> int:
@@ -753,7 +743,7 @@ class CollapsibleSection(QFrame):
         return self._body_layout
 
 
-class ZT30QtDashboard(QMainWindow):
+class MT11QtDashboard(QMainWindow):
     log_signal = pyqtSignal(str)
     telemetry_signal = pyqtSignal(object, object)
     laser_overlay_signal = pyqtSignal(object)
@@ -765,12 +755,12 @@ class ZT30QtDashboard(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("ZT30 Control")
+        self.setWindowTitle("MT11Control")
         self.resize(1440, 900)
 
-        self.client: Optional[ZT30UDPClient] = None
-        self.ai_client: Optional[SiyiAITrackingClient] = None
-        self.web_client: Optional[ZT30WebClient] = None
+        self.client: Optional[MT11UDPClient] = None
+        self.ai_client: Optional[MT11AITrackingClient] = None
+        self.web_client: Optional[MT11WebClient] = None
         self.connected_host = ""
         self.connected_port = 0
         self.connected_ai_host = ""
@@ -854,8 +844,8 @@ class ZT30QtDashboard(QMainWindow):
 
         tools.addWidget(QLabel("Main"))
         self.main_source_combo = QComboBox()
-        self.main_source_combo.addItems(["AI Camera", "Video 1"])
-        self.main_source_combo.setCurrentText("AI Camera")
+        self.main_source_combo.addItems(["Video 1", "Video 2"])
+        self.main_source_combo.setCurrentText("Video 1")
         self.main_source_combo.currentIndexChanged.connect(self.handle_source_change)
         tools.addWidget(self.main_source_combo)
 
@@ -1262,7 +1252,7 @@ class ZT30QtDashboard(QMainWindow):
         ai_connect = QPushButton("Connect AI")
         ai_connect.clicked.connect(lambda: self._ensure_ai_client(force=True))
 
-        grid.addWidget(QLabel("AI IP"), 0, 0)
+        grid.addWidget(QLabel("MT11 IP"), 0, 0)
         grid.addWidget(self.ai_host_edit, 0, 1, 1, 2)
         grid.addWidget(QLabel("Port"), 1, 0)
         grid.addWidget(self.ai_port_spin, 1, 1)
@@ -1417,7 +1407,7 @@ class ZT30QtDashboard(QMainWindow):
                 pass
 
         try:
-            self.client = ZT30UDPClient(host, port)
+            self.client = MT11UDPClient(host, port)
             self.connected_host = host
             self.connected_port = port
             self.log_message(f"UDP ready: {host}:{port}")
@@ -1430,13 +1420,13 @@ class ZT30QtDashboard(QMainWindow):
 
     def _ensure_web_client(self, force: bool = False):
         host = self.host_edit.text().strip()
-        base_url = f"http://{host}:82//cgi-bin/media.cgi"
+        base_url = f"http://{host}:82"
 
         if not force and self.web_client and getattr(self.web_client, "base_url", "") == base_url.rstrip("/"):
             return True
 
         try:
-            self.web_client = ZT30WebClient(base_url, timeout=5.0)
+            self.web_client = MT11WebClient(base_url, timeout=5.0)
             return True
         except Exception as exc:
             self.web_client = None
@@ -1444,7 +1434,9 @@ class ZT30QtDashboard(QMainWindow):
             return False
 
     def _ensure_ai_client(self, force: bool = False):
-        host = self.ai_host_edit.text().strip()
+        host = self.host_edit.text().strip()
+        if hasattr(self, "ai_host_edit"):
+            self.ai_host_edit.setText(host)
         port = self.ai_port_spin.value()
 
         if not force and self.ai_client and self.connected_ai_host == host and self.connected_ai_port == port:
@@ -1457,15 +1449,15 @@ class ZT30QtDashboard(QMainWindow):
                 pass
 
         try:
-            self.ai_client = SiyiAITrackingClient(host, port)
+            self.ai_client = MT11AITrackingClient(host, port)
             self.connected_ai_host = host
             self.connected_ai_port = port
-            self.log_message(f"AI UDP ready: {host}:{port}")
+            self.log_message(f"MT11 AI UDP ready: {host}:{port}")
             return True
 
         except Exception as exc:
             self.ai_client = None
-            self.log_message(f"AI UDP connect error: {exc}")
+            self.log_message(f"MT11 AI UDP connect error: {exc}")
             return False
 
     def start_streams(self):
@@ -1506,16 +1498,6 @@ class ZT30QtDashboard(QMainWindow):
     def _source_spec(self, name: str):
         name = name.strip()
         camera_host = self.host_edit.text().strip()
-
-        if name == "AI Camera":
-            if not self._ensure_ai_client():
-                raise RuntimeError("AI client not ready")
-            self._set_ai_rtsp_enabled(True)
-            return {
-                "name": name,
-                "url": ai_rtsp_url(self.ai_host_edit.text().strip()),
-                "transport": "udp",
-            }
 
         if name == "Video 1":
             return {"name": name, "url": rtsp_url(camera_host, 1), "transport": "tcp"}
@@ -1819,7 +1801,7 @@ class ZT30QtDashboard(QMainWindow):
             self.media_status_label.setText("Media: invalid URL")
             return
 
-        default_name = item.get("name") or Path(urlparse(url).path).name or "zt30_media"
+        default_name = item.get("name") or Path(urlparse(url).path).name or "mt11_media"
         target, _ = QFileDialog.getSaveFileName(self, "Download Media", str(Path.home() / "Downloads" / default_name))
         if not target:
             return
@@ -1924,13 +1906,13 @@ class ZT30QtDashboard(QMainWindow):
         self.video_stage.main_label.setCursor(Qt.CrossCursor if enabled else Qt.ArrowCursor)
         if not enabled:
             self.thermal_result_label.setText("Temperature: tool off")
-            restore_source = self.pre_thermal_source or "AI Camera"
+            restore_source = self.pre_thermal_source or "Video 1"
             restore_view = self.pre_thermal_view or "Zoom + Thermal"
             self._updating_sources = True
             self.main_source_combo.setCurrentText(restore_source)
             self.view_combo.setCurrentText(restore_view)
             self._updating_sources = False
-            mode = CAMERA_VIEWS.get(restore_view, "single_zoom_sub_thermal")
+            mode = CAMERA_VIEWS.get(restore_view, "zoom_sub_thermal")
             self.run_command("restore camera view", lambda: self._set_image_mode_verified(mode))
             if self.main_thread:
                 QTimer.singleShot(350, self.start_streams)
@@ -1947,7 +1929,7 @@ class ZT30QtDashboard(QMainWindow):
         self.thermal_result_label.setText("Temperature: click or drag on video")
         self.run_command(
             "thermal measurement view",
-            lambda: self._set_image_mode_verified("single_thermal_sub_zoom"),
+            lambda: self._set_image_mode_verified("thermal_sub_zoom"),
         )
         if self.main_thread:
             QTimer.singleShot(350, self.start_streams)
@@ -2679,10 +2661,10 @@ class ZT30QtDashboard(QMainWindow):
 
 def main():
     app = QApplication(sys.argv)
-    app.setApplicationName("ZT30 Control")
+    app.setApplicationName("MT11Control")
     app.setFont(QFont("Inter", 10))
 
-    window = ZT30QtDashboard()
+    window = MT11QtDashboard()
     window.show()
 
     sys.exit(app.exec_())

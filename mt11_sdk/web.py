@@ -1,4 +1,4 @@
-"""HTTP web server helper for files stored on SIYI ZT30 TF card."""
+"""HTTP web server helper for files stored on UniPod MT11 TF card."""
 
 from __future__ import annotations
 
@@ -10,8 +10,8 @@ from urllib.request import urlopen
 from .constants import DEFAULT_WEB_BASE
 
 
-class ZT30WebClient:
-    """Minimal client for ZT30 media web server on port 82."""
+class MT11WebClient:
+    """Minimal client for MT11 media web server on port 82."""
 
     def __init__(self, base_url: str = DEFAULT_WEB_BASE, timeout: float = 3.0):
         self.base_url = base_url.rstrip("/")

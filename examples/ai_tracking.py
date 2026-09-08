@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
-"""Basic SIYI AI Tracking Module II control example."""
+"""Basic UniPod MT11 AI tracking control example."""
 
 from __future__ import annotations
 
 import time
 
-from siyi_zt30 import DEFAULT_AI_IP, SiyiAITrackingClient
+from mt11_sdk import DEFAULT_AI_IP, MT11AITrackingClient
 
 
 def main():
-    ai = SiyiAITrackingClient(DEFAULT_AI_IP)
+    ai = MT11AITrackingClient(DEFAULT_AI_IP)
 
     try:
         print("firmware:", ai.request_firmware_version())

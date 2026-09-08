@@ -1,164 +1,54 @@
-# SIYI ZT30 UDP SDK and Control UI
+# UniPod MT11 SDK and MT11Control
 
-This package is an independent Python SDK and desktop UI for the SIYI ZT30 gimbal camera using the SIYI UDP protocol.
+Python SDK and PyQt5 desktop control UI for the Reebot/UniPod MT11 gimbal camera.
 
 Default device settings:
 
 ```text
-ZT30 IP      : 192.168.144.25
-AI module IP : 192.168.144.60
-SDK UDP port : 37260
-RTSP main    : rtsp://192.168.144.25:8554/video1
-RTSP sub     : rtsp://192.168.144.25:8554/video2
-Web media    : http://192.168.144.25:82//cgi-bin/media.cgi
+MT11 IP       : 192.168.144.25
+SDK UDP port  : 37260
+RTSP main     : rtsp://192.168.144.25:8554/video1
+RTSP sub      : rtsp://192.168.144.25:8554/video2
+Web media     : http://192.168.144.25:82
 ```
 
-## Features implemented
+## Implemented Features
 
-### UDP SDK
-
-Implemented command groups:
-
-- Firmware version and hardware ID
-- Working mode and configuration status
-- Gimbal speed rotation
-- Gimbal center
-- Gimbal absolute angle control
-- Gimbal attitude request
-- Manual zoom
-- Absolute zoom
-- Zoom value and max zoom request
-- Manual focus
-- Auto focus
-- Photo
-- Record toggle
-- Lock, follow, and FPV motion mode
+- Firmware and hardware ID requests
+- Gimbal speed, center, angle, and attitude controls
+- Zoom, focus, photo, record, and motion mode controls
+- MT11 video stitching modes
+- Thermal point, box, full-frame, palette, and gain controls
+- Laser enable, range, and target coordinate requests
 - Codec request and configuration
-- Image mode request and configuration
-- Thermal point temperature
-- Thermal box temperature
-- Thermal full image temperature
-- Thermal palette request and configuration
-- Thermal RAW mode
-- Thermal gain request and configuration
-- Thermal calibration request and configuration
-- Thermal calibration parameter request and configuration
-- Laser range request
-- Laser target latitude and longitude request
-- Laser status request and laser ON/OFF
-- Flight controller attitude injection
-- Flight controller GPS injection
-- Gimbal data stream request
-- UTC time setting
-- SD card formatting
-- Camera and gimbal soft restart
-- Raw hex sending for debugging
+- UTC time, system time, TF card info, SD format, and reboot commands
+- MT11 built-in AI tracking and tracking box stream
+- MT11 media web API browsing and downloads
+- PyQt5 live RTSP dashboard with joystick support
 
-### AI Tracking Module II SDK
-
-Implemented command groups:
-
-- AI module firmware version
-- AI recognition ON/OFF request and configuration
-- AI tracking status request
-- Track target by point or selection box
-- Cancel target tracking
-- Tracking coordinate stream status request and configuration
-- Automatic tracking coordinate stream listener
-
-### Web media helper
-
-Implemented HTTP helpers:
-
-- Get media directories
-- Get media count
-- Get media list
-
-### UI
-
-The included PyQt5 dashboard provides:
-
-- Connection setting
-- Large main live view focused on the video stream
-- Switchable primary live view between AI Camera and Video 1
-- Optional Video 2 picture-in-picture with fast main/PiP window swap
-- Collapsible right control panel
-- Gimbal pan and tilt movement buttons
-- Joystick pan and tilt control through `/dev/input/js0`
-- Center command
-- Angle control
-- Live attitude telemetry
-- Zoom and focus controls
-- Photo and record buttons
-- Camera view selector with common names
-- SIYI AI Tracking Module II controls
-- Click-to-track target selection on the live view
-- AI tracking target box overlay
-- Laser rangefinder controls
-- Thermal palette controls
-- Full image and point thermometric request
-- Maintenance buttons
-- Embedded RTSP playback through `ffmpeg`, with optional external `ffplay`
-
-## Requirements
-
-Python 3.9 or newer is recommended.
-
-The SDK uses only Python standard library.
-The modern dashboard uses PyQt5. Install the UI dependencies with:
-
-```bash
-python3 -m pip install ".[ui]"
-```
-
-To decode RTSP streams in the dashboard, install FFmpeg:
-
-```bash
-sudo apt install ffmpeg
-```
-
-If you install packages manually instead of using `.[ui]`, install PyQt5:
-
-```bash
-python3 -m pip install PyQt5
-```
-
-If `ffplay` is available from the FFmpeg package, the dashboard can also open a stream in an external FFplay window.
-
-## Quick setup
-
-Install the Python environment and create a launcher:
+## Setup
 
 ```bash
 ./setup.sh
-./run_dashboard.sh
+./run_mt11control.sh
 ```
 
-Build a Linux AppImage:
+Manual run:
+
+```bash
+python3 ui/mt11_dashboard_qt.py
+```
+
+Build AppImage:
 
 ```bash
 ./install.sh
-./ZT30Control.AppImage
+./MT11Control.AppImage
 ```
 
-Joystick control uses the Linux joystick event device directly:
+## Network
 
-```text
-Device : /dev/input/js0
-Axis 4 : pan, negative left and positive right
-Axis 5 : tilt, negative down and positive up
-```
-
-If the dashboard reports permission denied, add your user to the input group and log in again:
-
-```bash
-sudo usermod -aG input "$USER"
-```
-
-
-## Network setup
-
-Set your computer or companion computer Ethernet IP to the same subnet as ZT30.
+Set your computer or companion computer Ethernet IP to the same subnet as MT11.
 
 Example:
 
@@ -172,44 +62,14 @@ Test connection:
 
 ```bash
 ping 192.168.144.25
-ping 192.168.144.60
 ```
 
-## Run the example
-
-From the package root:
-
-```bash
-python3 examples/basic_control.py
-```
-
-Run the AI tracking module example:
-
-```bash
-python3 examples/ai_tracking.py
-```
-
-## Run the UI
-
-From the package root:
-
-```bash
-python3 ui/zt30_dashboard_qt.py
-```
-
-The original Tkinter UI is still available as a fallback:
-
-```bash
-python3 ui/zt30_dashboard_ui.py
-python3 ui/zt30_control_ui.py
-```
-
-## Basic SDK usage
+## Basic SDK Usage
 
 ```python
-from siyi_zt30 import ZT30UDPClient
+from mt11_sdk import MT11UDPClient
 
-cam = ZT30UDPClient("192.168.144.25")
+cam = MT11UDPClient("192.168.144.25")
 
 print(cam.request_firmware_version())
 print(cam.center())
@@ -228,68 +88,27 @@ print(cam.request_laser_range())
 cam.close()
 ```
 
-AI Tracking Module II usage:
+## AI Tracking
+
+MT11 AI tracking is built into the camera and uses the same IP/UDP port as the main SDK endpoint.
 
 ```python
-from siyi_zt30 import SiyiAITrackingClient
+from mt11_sdk import DEFAULT_AI_IP, MT11AITrackingClient
 
-ai = SiyiAITrackingClient("192.168.144.60")
+ai = MT11AITrackingClient(DEFAULT_AI_IP)
 
 print(ai.request_firmware_version())
-ai.set_recognition_enabled(True)
-ai.track_point(640, 360)
-ai.set_coordinate_stream_enabled(True)
+print(ai.set_recognition_enabled(True))
+print(ai.track_point(640, 360))
+print(ai.set_coordinate_stream_enabled(True))
 
 ai.start_coordinate_listener(lambda box: print(box))
 ```
 
-## Important operation notes
+The dashboard normalizes live-view clicks to the MT11 AI coordinate space: `1280 x 720`.
 
-For AI tracking, the dashboard normalizes live-view clicks to the module coordinate
-space documented by SIYI: 1280 x 720. Use the AI module IP field when your module
-address differs from the default `192.168.144.60`.
+## Notes
 
-For selecting AI targets, use the AI RTSP stream:
-
-```text
-rtsp://192.168.144.60:554/video0
-```
-
-The dashboard's AI RTSP mode enables the module RTSP switch through SDK command
-`0x0B` and opens the stream over UDP transport. The camera streams
-`rtsp://192.168.144.25:8554/video1` and `rtsp://192.168.144.25:8554/video2` are still
-available for normal monitoring, but AI target selection should be done against the AI
-camera stream.
-
-For speed movement, always send stop after releasing a button or joystick:
-
-```python
-cam.rotate_speed(40, 0)
-cam.stop_rotation()
-```
-
-The laser rangefinder is off by default on newer firmware. Turn it on before requesting range:
-
-```python
-cam.set_laser(True)
-print(cam.request_laser_range())
-```
-
-Do not use laser ranging indoors at less than 5 m, especially toward reflective targets.
-
-## File layout
-
-```text
-siyi_zt30/
-  __init__.py
-  client.py
-  constants.py
-  protocol.py
-  web.py
-examples/
-  basic_control.py
-ui/
-  zt30_control_ui.py
-README.md
-pyproject.toml
-```
+- MT11 video stitching uses two stream IDs, not the old one-byte mode enum.
+- Supported MT11 view presets in the dashboard are Zoom + Thermal, Thermal + Zoom, and Zoom/Thermal + Thermal.
+- The package directory is still named `mt11_sdk` to keep existing imports stable, but the exported primary classes are `MT11UDPClient`, `MT11AITrackingClient`, and `MT11WebClient`.

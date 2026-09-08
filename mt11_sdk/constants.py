@@ -1,11 +1,11 @@
-"""Constants for SIYI ZT30 SDK."""
+"""Constants for UniPod MT11 SDK."""
 
 DEFAULT_IP = "192.168.144.25"
-DEFAULT_AI_IP = "192.168.144.60"
+DEFAULT_AI_IP = DEFAULT_IP
 DEFAULT_PORT = 37260
 DEFAULT_RTSP_MAIN = "rtsp://192.168.144.25:8554/video1"
 DEFAULT_RTSP_SUB = "rtsp://192.168.144.25:8554/video2"
-DEFAULT_WEB_BASE = "http://192.168.144.25:82//cgi-bin/media.cgi"
+DEFAULT_WEB_BASE = "http://192.168.144.25:82"
 
 WORKING_MODES = {
     0: "lock",
@@ -23,21 +23,26 @@ PHOTO_RECORD_FUNC = {
     "enable_hdmi": 6,
     "enable_cvbs": 7,
     "disable_hdmi_cvbs": 8,
+    "downward_view": 9,
+    "zoom_linkage_toggle": 10,
 }
 
 IMAGE_MODES = {
-    0: "split_zoom_thermal_sub_wide",
-    1: "split_wide_thermal_sub_zoom",
-    2: "split_zoom_wide_sub_thermal",
-    3: "single_zoom_sub_thermal",
-    4: "single_zoom_sub_wide",
-    5: "single_wide_sub_thermal",
-    6: "single_wide_sub_zoom",
-    7: "single_thermal_sub_zoom",
-    8: "single_thermal_sub_wide",
+    (0, 2): "zoom_sub_thermal",
+    (2, 0): "thermal_sub_zoom",
+    (3, 2): "zoom_thermal_sub_thermal",
 }
 
 IMAGE_MODE_BY_NAME = {v: k for k, v in IMAGE_MODES.items()}
+MT11_STREAM_NAMES = {
+    0: "zoom",
+    1: "wide",
+    2: "thermal",
+    3: "zoom_thermal",
+    4: "wide_thermal",
+    5: "zoom_wide",
+    6: "none",
+}
 
 THERMAL_PALETTES = {
     0: "white_hot",
