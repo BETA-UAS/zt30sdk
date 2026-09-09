@@ -2185,6 +2185,12 @@ class MT11QtDashboard(QMainWindow):
 
     def _apply_ai_tracking_box(self, box):
         if box and hasattr(self, "ai_status_label"):
+            if self._is_full_frame_ai_box(box):
+                self.video_stage.set_ai_tracking_box(None)
+                self.last_selected_ai_box = None
+                self.ai_status_label.setText(f"AI: tracking full frame | {box.x},{box.y}")
+                return
+
             self.video_stage.set_ai_tracking_box(box)
             self.last_selected_ai_box = box
 
@@ -2199,6 +2205,15 @@ class MT11QtDashboard(QMainWindow):
     def _apply_ai_status(self, text: str):
         if hasattr(self, "ai_status_label"):
             self.ai_status_label.setText(text)
+
+    @staticmethod
+    def _is_full_frame_ai_box(box: AITrackingBox) -> bool:
+        return (
+            box.target_id == 255
+            and box.track_state == 4
+            and box.width >= AI_COORD_SIZE[0] * 0.90
+            and box.height >= AI_COORD_SIZE[1] * 0.90
+        )
 
     @staticmethod
     def _onoff(value: Optional[bool]) -> str:
