@@ -340,7 +340,7 @@ class JoystickThread(QThread):
                 if now >= next_send:
                     self.speed_changed.emit(
                         self._axis_to_speed(self._axes[JOYSTICK_PAN_AXIS]),
-                        -self._axis_to_speed(self._axes[JOYSTICK_TILT_AXIS]),
+                        self._axis_to_speed(self._axes[JOYSTICK_TILT_AXIS]),
                     )
                     self.zoom_changed.emit(self._axis_to_zoom_direction(self._axes[JOYSTICK_ZOOM_AXIS]))
                     next_send = now + 0.10
