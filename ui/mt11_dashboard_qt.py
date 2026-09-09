@@ -2008,12 +2008,14 @@ class MT11QtDashboard(QMainWindow):
             self.cancel_ai_tracking()
 
     def track_ai_point(self, x: int, y: int):
+        self.ai_tracking_signal.emit(None)
         overlay_enabled = self.ai_overlay_check.isChecked()
         self.run_ai_command("AI track point", lambda: self._track_ai_point_worker(x, y, overlay_enabled))
 
     def _track_ai_point_worker(self, x: int, y: int, overlay_enabled: bool):
         recognition = self._prepare_ai_track()
-        result = self.ai_client.track_point(x, y)
+        cmd_x, cmd_y = self._ai_to_track_command_point(x, y)
+        result = self.ai_client.track_point(cmd_x, cmd_y)
         if overlay_enabled:
             time.sleep(0.10)
             self._start_ai_overlay_worker()
@@ -2021,8 +2023,8 @@ class MT11QtDashboard(QMainWindow):
             "recognition": recognition,
             "track_result": result,
             "status": self.ai_client.describe_select_status(result),
-            "x": x,
-            "y": y,
+            "overlay_xy": (x, y),
+            "command_xy": (cmd_x, cmd_y),
         }
 
     def track_ai_box(self, left: int, top: int, right: int, bottom: int):
@@ -2046,18 +2048,8 @@ class MT11QtDashboard(QMainWindow):
     def _track_ai_box_worker(self, left: int, top: int, right: int, bottom: int, overlay_enabled: bool):
         recognition = self._prepare_ai_track()
         left, top, right, bottom = self._expanded_ai_box(left, top, right, bottom)
-        result = self.ai_client.track_box(left, top, right, bottom)
-        if result == 1:
-            self.ai_tracking_signal.emit(
-                AITrackingBox(
-                    x=(left + right) // 2,
-                    y=(top + bottom) // 2,
-                    width=max(2, right - left),
-                    height=max(2, bottom - top),
-                    target_id=255,
-                    track_state=4,
-                )
-            )
+        cmd_left, cmd_top, cmd_right, cmd_bottom = self._ai_to_track_command_box(left, top, right, bottom)
+        result = self.ai_client.track_box(cmd_left, cmd_top, cmd_right, cmd_bottom)
         if overlay_enabled:
             time.sleep(0.10)
             self._start_ai_overlay_worker()
@@ -2065,7 +2057,8 @@ class MT11QtDashboard(QMainWindow):
             "recognition": recognition,
             "track_result": result,
             "status": self.ai_client.describe_select_status(result),
-            "box": (left, top, right, bottom),
+            "overlay_box": (left, top, right, bottom),
+            "command_box": (cmd_left, cmd_top, cmd_right, cmd_bottom),
         }
 
     def _prepare_ai_track(self):
@@ -2087,6 +2080,35 @@ class MT11QtDashboard(QMainWindow):
         except Exception:
             pass
         return self.ai_client.set_recognition_enabled(True)
+
+    def _track_command_size(self) -> tuple[int, int]:
+        if not self.client and not self._ensure_client():
+            return AI_COORD_SIZE
+
+        source = self.main_source_combo.currentText() if hasattr(self, "main_source_combo") else "Video 1"
+        stream_type = 2 if source == "Video 2" else 1
+
+        try:
+            specs = self.client.request_codec_specs(stream_type)
+        except Exception as exc:
+            self.log_message(f"AI command size: codec query failed: {exc}")
+            return AI_COORD_SIZE
+
+        if not specs or specs.width <= 0 or specs.height <= 0:
+            return AI_COORD_SIZE
+        return specs.width, specs.height
+
+    def _ai_to_track_command_point(self, x: int, y: int) -> tuple[int, int]:
+        width, height = self._track_command_size()
+        return (
+            clamp(round(x * (width - 1) / (AI_COORD_SIZE[0] - 1)), 0, width - 1),
+            clamp(round(y * (height - 1) / (AI_COORD_SIZE[1] - 1)), 0, height - 1),
+        )
+
+    def _ai_to_track_command_box(self, left: int, top: int, right: int, bottom: int) -> tuple[int, int, int, int]:
+        cmd_left, cmd_top = self._ai_to_track_command_point(left, top)
+        cmd_right, cmd_bottom = self._ai_to_track_command_point(right, bottom)
+        return min(cmd_left, cmd_right), min(cmd_top, cmd_bottom), max(cmd_left, cmd_right), max(cmd_top, cmd_bottom)
 
     @staticmethod
     def _expanded_ai_box(left: int, top: int, right: int, bottom: int, min_size: int = 120) -> tuple[int, int, int, int]:
@@ -2163,11 +2185,8 @@ class MT11QtDashboard(QMainWindow):
 
     def _apply_ai_tracking_box(self, box):
         if box and hasattr(self, "ai_status_label"):
-            if not self._is_unhelpful_full_frame_ai_box(box):
-                self.video_stage.set_ai_tracking_box(box)
-                self.last_selected_ai_box = box
-            elif self.last_selected_ai_box:
-                self.video_stage.set_ai_tracking_box(self.last_selected_ai_box)
+            self.video_stage.set_ai_tracking_box(box)
+            self.last_selected_ai_box = box
 
             if box.target_id == 255:
                 self.ai_status_label.setText(f"AI: camera feedback | {box.x},{box.y}")
@@ -2180,15 +2199,6 @@ class MT11QtDashboard(QMainWindow):
     def _apply_ai_status(self, text: str):
         if hasattr(self, "ai_status_label"):
             self.ai_status_label.setText(text)
-
-    @staticmethod
-    def _is_unhelpful_full_frame_ai_box(box: AITrackingBox) -> bool:
-        return (
-            box.target_id == 255
-            and box.track_state == 4
-            and box.width >= AI_COORD_SIZE[0] * 0.90
-            and box.height >= AI_COORD_SIZE[1] * 0.90
-        )
 
     @staticmethod
     def _onoff(value: Optional[bool]) -> str:
