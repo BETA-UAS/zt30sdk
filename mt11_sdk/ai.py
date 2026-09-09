@@ -29,6 +29,15 @@ AI_TRACK_STATES = {
     4: "normal_arbitrary",
 }
 
+AI_SELECT_STATUS = {
+    0: "failed",
+    1: "success",
+    2: "not_ai_tracking_mode",
+    3: "unsupported_stream",
+    4: "insufficient_texture",
+    5: "eis_enabled",
+}
+
 
 @dataclass(frozen=True)
 class AITrackingBox:
@@ -276,6 +285,14 @@ class MT11AITrackingClient:
             return None
         self.last_select_error = pkt.payload[0]
         return pkt.payload[0]
+
+    @staticmethod
+    def describe_select_status(status: Optional[int]) -> str:
+        if status is None:
+            return "no_response"
+        if status == 8:
+            return "unknown_8_try_larger_textured_roi"
+        return AI_SELECT_STATUS.get(status, f"unknown_{status}")
 
     @staticmethod
     def _clamp_u16(value: int) -> int:

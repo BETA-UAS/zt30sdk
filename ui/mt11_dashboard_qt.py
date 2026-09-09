@@ -572,6 +572,9 @@ class VideoStage(QFrame):
         if self._thermal_measurement:
             self._draw_thermal_measurement(painter, pixmap, self._thermal_measurement)
 
+        if self._ai_tracking_box:
+            self._draw_ai_tracking_box(painter, pixmap, self._ai_tracking_box)
+
         painter.end()
 
     def _draw_thermal_measurement(self, painter: QPainter, pixmap: QPixmap, data):
@@ -2014,7 +2017,13 @@ class MT11QtDashboard(QMainWindow):
         if overlay_enabled:
             time.sleep(0.10)
             self._start_ai_overlay_worker()
-        return {"recognition": recognition, "track_result": result, "x": x, "y": y}
+        return {
+            "recognition": recognition,
+            "track_result": result,
+            "status": self.ai_client.describe_select_status(result),
+            "x": x,
+            "y": y,
+        }
 
     def track_ai_box(self, left: int, top: int, right: int, bottom: int):
         if self.thermal_tool_enabled:
@@ -2036,13 +2045,26 @@ class MT11QtDashboard(QMainWindow):
 
     def _track_ai_box_worker(self, left: int, top: int, right: int, bottom: int, overlay_enabled: bool):
         recognition = self._prepare_ai_track()
+        left, top, right, bottom = self._expanded_ai_box(left, top, right, bottom)
         result = self.ai_client.track_box(left, top, right, bottom)
+        if result == 1:
+            self.ai_tracking_signal.emit(
+                AITrackingBox(
+                    x=(left + right) // 2,
+                    y=(top + bottom) // 2,
+                    width=max(2, right - left),
+                    height=max(2, bottom - top),
+                    target_id=255,
+                    track_state=4,
+                )
+            )
         if overlay_enabled:
             time.sleep(0.10)
             self._start_ai_overlay_worker()
         return {
             "recognition": recognition,
             "track_result": result,
+            "status": self.ai_client.describe_select_status(result),
             "box": (left, top, right, bottom),
         }
 
@@ -2065,6 +2087,42 @@ class MT11QtDashboard(QMainWindow):
         except Exception:
             pass
         return self.ai_client.set_recognition_enabled(True)
+
+    @staticmethod
+    def _expanded_ai_box(left: int, top: int, right: int, bottom: int, min_size: int = 120) -> tuple[int, int, int, int]:
+        left, right = sorted((clamp(left, 0, AI_COORD_SIZE[0] - 1), clamp(right, 0, AI_COORD_SIZE[0] - 1)))
+        top, bottom = sorted((clamp(top, 0, AI_COORD_SIZE[1] - 1), clamp(bottom, 0, AI_COORD_SIZE[1] - 1)))
+        width = max(2, right - left)
+        height = max(2, bottom - top)
+        cx = (left + right) / 2.0
+        cy = (top + bottom) / 2.0
+        half_w = max(width, min_size) / 2.0
+        half_h = max(height, min_size) / 2.0
+
+        left = round(cx - half_w)
+        right = round(cx + half_w)
+        top = round(cy - half_h)
+        bottom = round(cy + half_h)
+
+        if left < 0:
+            right -= left
+            left = 0
+        if right > AI_COORD_SIZE[0] - 1:
+            left -= right - (AI_COORD_SIZE[0] - 1)
+            right = AI_COORD_SIZE[0] - 1
+        if top < 0:
+            bottom -= top
+            top = 0
+        if bottom > AI_COORD_SIZE[1] - 1:
+            top -= bottom - (AI_COORD_SIZE[1] - 1)
+            bottom = AI_COORD_SIZE[1] - 1
+
+        return (
+            clamp(left, 0, AI_COORD_SIZE[0] - 1),
+            clamp(top, 0, AI_COORD_SIZE[1] - 1),
+            clamp(right, 0, AI_COORD_SIZE[0] - 1),
+            clamp(bottom, 0, AI_COORD_SIZE[1] - 1),
+        )
 
     def cancel_ai_tracking(self):
         self.run_ai_command("AI cancel tracking", self._cancel_ai_tracking_worker)
@@ -2105,6 +2163,12 @@ class MT11QtDashboard(QMainWindow):
 
     def _apply_ai_tracking_box(self, box):
         if box and hasattr(self, "ai_status_label"):
+            if not self._is_unhelpful_full_frame_ai_box(box):
+                self.video_stage.set_ai_tracking_box(box)
+                self.last_selected_ai_box = box
+            elif self.last_selected_ai_box:
+                self.video_stage.set_ai_tracking_box(self.last_selected_ai_box)
+
             if box.target_id == 255:
                 self.ai_status_label.setText(f"AI: camera feedback | {box.x},{box.y}")
             else:
