@@ -84,6 +84,13 @@ THERMAL_NAMES = {
     "Aurora": "aurora",
 }
 
+JOYSTICK_DEVICE = "/dev/input/js0"
+DEFAULT_JOYSTICK_NAME = "EdgeTX Radiomaster Pocket Joystick"
+JOYSTICK_PAN_AXIS = 0
+JOYSTICK_TILT_AXIS = 1
+JOYSTICK_ZOOM_AXIS = 2
+JOYSTICK_ZOOM_THRESHOLD = 0.20
+
 
 def rtsp_url(host: str, stream: int) -> str:
     return f"rtsp://{host}:8554/video{stream}"
@@ -284,6 +291,7 @@ class FFmpegStreamThread(QThread):
 
 class JoystickThread(QThread):
     speed_changed = pyqtSignal(int, int)
+    zoom_changed = pyqtSignal(int)
     status_changed = pyqtSignal(str)
     message = pyqtSignal(str)
 
@@ -299,7 +307,11 @@ class JoystickThread(QThread):
         self.speed_getter = speed_getter
         self.deadzone_getter = deadzone_getter
         self._running = False
-        self._axes = {4: 0, 5: 0}
+        self._axes = {
+            JOYSTICK_PAN_AXIS: 0,
+            JOYSTICK_TILT_AXIS: 0,
+            JOYSTICK_ZOOM_AXIS: 0,
+        }
 
     def run(self):
         event_size = struct.calcsize("IhBB")
@@ -308,8 +320,8 @@ class JoystickThread(QThread):
 
         try:
             fd = os.open(self.device, os.O_RDONLY | os.O_NONBLOCK)
-            self.status_changed.emit("Active")
-            self.message.emit(f"Joystick active: {self.device}")
+            self.status_changed.emit(DEFAULT_JOYSTICK_NAME)
+            self.message.emit(f"Joystick connected: {DEFAULT_JOYSTICK_NAME} ({self.device})")
             next_send = 0.0
 
             while self._running:
@@ -320,15 +332,17 @@ class JoystickThread(QThread):
 
                 if len(data) == event_size:
                     _time_ms, value, event_type, axis = struct.unpack("IhBB", data)
-                    if event_type & 0x02 and axis in (4, 5):
+                    clean_type = event_type & ~0x80
+                    if clean_type == 0x02 and axis in self._axes:
                         self._axes[axis] = value
 
                 now = time.monotonic()
                 if now >= next_send:
                     self.speed_changed.emit(
-                        self._axis_to_speed(self._axes[4]),
-                        self._axis_to_speed(self._axes[5]),
+                        self._axis_to_speed(self._axes[JOYSTICK_PAN_AXIS]),
+                        -self._axis_to_speed(self._axes[JOYSTICK_TILT_AXIS]),
                     )
+                    self.zoom_changed.emit(self._axis_to_zoom_direction(self._axes[JOYSTICK_ZOOM_AXIS]))
                     next_send = now + 0.10
 
                 time.sleep(0.01)
@@ -349,6 +363,7 @@ class JoystickThread(QThread):
             if fd is not None:
                 os.close(fd)
             self.speed_changed.emit(0, 0)
+            self.zoom_changed.emit(0)
 
     def stop(self):
         self._running = False
@@ -365,6 +380,15 @@ class JoystickThread(QThread):
 
         scaled = round(((magnitude - deadzone) / max(1, 32767 - deadzone)) * speed_limit)
         return clamp(scaled, 0, speed_limit) * (1 if value > 0 else -1)
+
+    def _axis_to_zoom_direction(self, value: int) -> int:
+        value = clamp(value, -32767, 32767)
+        normalized = value / 32767.0
+        if normalized > JOYSTICK_ZOOM_THRESHOLD:
+            return 1
+        if normalized < -JOYSTICK_ZOOM_THRESHOLD:
+            return -1
+        return 0
 
 
 class ClickableVideoLabel(QLabel):
@@ -776,6 +800,8 @@ class MT11QtDashboard(QMainWindow):
         self.primary_on_main = True
         self.joystick_thread: Optional[JoystickThread] = None
         self.last_joystick_speed = (None, None)
+        self.last_joystick_zoom_dir = 0
+        self._joystick_manual_disabled = False
         self.laser_enabled = False
         self.laser_range: Optional[float] = None
         self.laser_target = None
@@ -805,6 +831,7 @@ class MT11QtDashboard(QMainWindow):
         self.thermal_result_signal.connect(self._apply_thermal_result)
 
         self._ensure_client()
+        QTimer.singleShot(250, self._auto_start_joystick_if_available)
 
         self.telemetry_timer = QTimer(self)
         self.telemetry_timer.timeout.connect(self.refresh_status)
@@ -1305,7 +1332,7 @@ class MT11QtDashboard(QMainWindow):
     def _build_joystick_controls(self):
         box = self._section("Joystick")
 
-        self.joystick_check = QCheckBox("Use /dev/input/js0")
+        self.joystick_check = QCheckBox(f"Use {DEFAULT_JOYSTICK_NAME}")
         self.joystick_check.toggled.connect(self.toggle_joystick)
 
         self.joystick_status = QLabel("Off")
@@ -1319,7 +1346,7 @@ class MT11QtDashboard(QMainWindow):
 
         self.deadzone_slider = QSlider(Qt.Horizontal)
         self.deadzone_slider.setRange(0, 16000)
-        self.deadzone_slider.setValue(5000)
+        self.deadzone_slider.setValue(round(32767 * 0.08))
 
         dz = QHBoxLayout()
         dz.addWidget(QLabel("Deadzone"))
@@ -1414,6 +1441,7 @@ class MT11QtDashboard(QMainWindow):
             self.connected_host = host
             self.connected_port = port
             self.log_message(f"UDP ready: {host}:{port}")
+            QTimer.singleShot(250, self._auto_start_joystick_if_available)
             return True
 
         except Exception as exc:
@@ -2387,8 +2415,10 @@ class MT11QtDashboard(QMainWindow):
 
     def toggle_joystick(self, enabled: bool):
         if enabled:
+            self._joystick_manual_disabled = False
             self.start_joystick()
         else:
+            self._joystick_manual_disabled = True
             self.stop_joystick()
 
     def start_joystick(self):
@@ -2396,19 +2426,27 @@ class MT11QtDashboard(QMainWindow):
             self.joystick_check.setChecked(False)
             return
 
+        if not os.path.exists(JOYSTICK_DEVICE):
+            self.joystick_status.setText("Missing")
+            self.log_message(f"Joystick not found: {JOYSTICK_DEVICE}")
+            self.joystick_check.setChecked(False)
+            return
+
         self.stop_joystick()
 
         self.joystick_thread = JoystickThread(
-            "/dev/input/js0",
+            JOYSTICK_DEVICE,
             self.speed_slider.value,
             self.deadzone_slider.value,
             self,
         )
 
         self.joystick_thread.speed_changed.connect(self.handle_joystick_speed)
+        self.joystick_thread.zoom_changed.connect(self.handle_joystick_zoom)
         self.joystick_thread.status_changed.connect(self.joystick_status.setText)
         self.joystick_thread.message.connect(self.log_message)
         self.joystick_thread.start()
+        self.joystick_check.setChecked(True)
 
     def stop_joystick(self):
         if self.joystick_thread:
@@ -2421,8 +2459,11 @@ class MT11QtDashboard(QMainWindow):
         if self.client:
             try:
                 self.client.stop_rotation()
+                self.client.zoom_stop()
             except Exception:
                 pass
+        self.last_joystick_speed = (None, None)
+        self.last_joystick_zoom_dir = 0
 
     def handle_joystick_speed(self, yaw: int, pitch: int):
         speed = (yaw, pitch)
@@ -2436,6 +2477,32 @@ class MT11QtDashboard(QMainWindow):
             target=lambda: self.client.rotate_speed(yaw, pitch),
             daemon=True,
         ).start()
+
+    def handle_joystick_zoom(self, direction: int):
+        if direction == self.last_joystick_zoom_dir or not self.client:
+            return
+
+        self.last_joystick_zoom_dir = direction
+        if direction > 0:
+            target = self.client.zoom_in
+        elif direction < 0:
+            target = self.client.zoom_out
+        else:
+            target = self.client.zoom_stop
+
+        threading.Thread(target=target, daemon=True).start()
+
+    def _auto_start_joystick_if_available(self):
+        if self.joystick_thread or self._joystick_manual_disabled or not self.client:
+            return
+
+        if os.path.exists(JOYSTICK_DEVICE):
+            if not self.joystick_check.isChecked():
+                self.joystick_check.setChecked(True)
+            else:
+                self.start_joystick()
+        elif hasattr(self, "joystick_status"):
+            self.joystick_status.setText("Missing")
 
     def log_message(self, text: str):
         self.log_signal.emit(text)
