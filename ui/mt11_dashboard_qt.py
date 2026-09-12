@@ -76,6 +76,8 @@ FPV_RELAY_ENABLED_DEFAULT = os.environ.get("MT11_FPV_RELAY_ENABLED", "1").strip(
 FPV_RELAY_MAX_DELAY_US = int(os.environ.get("MT11_FPV_MAX_DELAY_US", "250000"))
 FPV_RELAY_BUFFER_SIZE = int(os.environ.get("MT11_FPV_BUFFER_SIZE", "1048576"))
 FPV_RELAY_REORDER_QUEUE = int(os.environ.get("MT11_FPV_REORDER_QUEUE", "256"))
+LASER_RANGE_REFRESH_MS = int(os.environ.get("MT11_LASER_RANGE_REFRESH_MS", "1000"))
+LASER_TARGET_REFRESH_MS = int(os.environ.get("MT11_LASER_TARGET_REFRESH_MS", "5000"))
 SIMULATOR_MARKER = Path(os.environ.get("MT11_SIMULATOR_MARKER", Path.home() / ".mt11control_simulator"))
 SIMULATOR_AVAILABLE = os.environ.get("MT11_SIMULATOR_AVAILABLE", "0").strip().lower() in ("1", "true", "yes", "on") or SIMULATOR_MARKER.exists()
 SIM_RTSP_BASE = os.environ.get("MT11_SIM_RTSP_BASE", "rtsp://127.0.0.1:8554")
@@ -1351,6 +1353,7 @@ class MT11QtDashboard(QMainWindow):
         self.laser_enabled = False
         self.laser_range: Optional[float] = None
         self.laser_target = None
+        self.last_laser_target_refresh = 0.0
         self.last_selected_ai_box: Optional[AITrackingBox] = None
         self.current_media_type = 0
         self.media_items = []
@@ -1400,7 +1403,7 @@ class MT11QtDashboard(QMainWindow):
 
         self.laser_timer = QTimer(self)
         self.laser_timer.timeout.connect(self.refresh_laser_overlay)
-        self.laser_timer.start(4000)
+        self.laser_timer.start(LASER_RANGE_REFRESH_MS)
 
         # Coalesce incoming frames. Without this limiter, two streams can queue
         # more redraws than the UI can present cleanly on field computers.
@@ -1788,10 +1791,10 @@ class MT11QtDashboard(QMainWindow):
         laser_off.clicked.connect(lambda: self.set_laser_enabled(False))
 
         measure = QPushButton("Range")
-        measure.clicked.connect(self.refresh_laser_overlay)
+        measure.clicked.connect(lambda: self.refresh_laser_overlay(force_target=False))
 
         target = QPushButton("GPS")
-        target.clicked.connect(self.refresh_laser_overlay)
+        target.clicked.connect(lambda: self.refresh_laser_overlay(force_target=True))
 
         row.addWidget(laser_on)
         row.addWidget(laser_off)
@@ -2343,17 +2346,18 @@ class MT11QtDashboard(QMainWindow):
 
             if enabled:
                 self.log_message(f"laser on: {result if result is not None else 'OK'}")
-                self._update_laser_measurement()
+                self._update_laser_measurement(force_target=True)
             else:
                 self.laser_range = None
                 self.laser_target = None
+                self.last_laser_target_refresh = 0.0
                 self.laser_overlay_signal.emit([])
                 self.log_message(f"laser off: {result if result is not None else 'OK'}")
 
         except Exception as exc:
             self.log_message(f"laser {'on' if enabled else 'off'}: ERROR {exc}")
 
-    def refresh_laser_overlay(self):
+    def refresh_laser_overlay(self, force_target: bool = False):
         if not self.laser_enabled or self.laser_refresh_pending:
             return
 
@@ -2361,14 +2365,21 @@ class MT11QtDashboard(QMainWindow):
             return
 
         self.laser_refresh_pending = True
-        threading.Thread(target=self._update_laser_measurement, daemon=True).start()
+        threading.Thread(
+            target=self._update_laser_measurement,
+            kwargs={"force_target": force_target},
+            daemon=True,
+        ).start()
 
-    def _update_laser_measurement(self):
+    def _update_laser_measurement(self, force_target: bool = False):
         try:
             self.laser_range = self.client.request_laser_range()
-            self.laser_target = self.client.request_laser_target_latlon()
+            now = time.monotonic()
+            target_stale = (now - self.last_laser_target_refresh) * 1000 >= LASER_TARGET_REFRESH_MS
+            if force_target or self.laser_target is None or target_stale:
+                self.laser_target = self.client.request_laser_target_latlon()
+                self.last_laser_target_refresh = now
             self.laser_overlay_signal.emit(self._laser_overlay_lines())
-            self.log_message("laser overlay: updated")
         except Exception as exc:
             self.log_message(f"laser overlay: ERROR {exc}")
         finally:
