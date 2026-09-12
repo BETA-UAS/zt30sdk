@@ -89,6 +89,9 @@ You can change the source/output in the Connection panel. For fixed deployments,
 MT11_FPV_SOURCE_URL=rtsp://192.168.144.26:554/
 MT11_FPV_RELAY_URL=rtsp://127.0.0.1:8554/cam2
 MT11_FPV_RELAY_ENABLED=1
+MT11_FPV_RELAY_MODE=qgc_safe
+MT11_FPV_SAFE_FPS=25
+MT11_FPV_SAFE_BITRATE=2500k
 MT11_FPV_MAX_DELAY_US=250000
 MT11_FPV_RELAY_FALLBACK_PORT=8555
 MT11_FFMPEG_BIN=/usr/bin/ffmpeg
@@ -96,6 +99,8 @@ MT11_MEDIAMTX_BIN=/usr/local/bin/mediamtx
 ```
 
 If another MediaMTX is already using `8554`, MT11Control probes whether the configured output path accepts publishers. If it does not, the app automatically starts its own TCP-only MediaMTX on the fallback port and updates the FPV output URL.
+
+`QGC Safe` mode decodes and re-encodes the FPV feed as low-latency H.264 Baseline with fixed FPS/keyframes. Use `Raw Low Latency` only when you need the lowest possible delay and QGroundControl is stable with the source bitstream.
 
 ## Local Stream Simulator
 

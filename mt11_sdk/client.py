@@ -303,8 +303,24 @@ class MT11UDPClient:
             need_ack=False,
         )
 
-    def take_photo(self) -> None:
-        self.camera_function("photo", wait_response=False)
+    def take_photo(self) -> Optional[Dict[str, Any]]:
+        pkt = self.send(
+            0x0C,
+            struct.pack("<B", PHOTO_RECORD_FUNC["photo"]),
+            wait_response=True,
+            need_ack=False,
+            response_cmd_id=0x0B,
+        )
+        if not pkt or not pkt.payload:
+            raise RuntimeError("no photo feedback from camera")
+        info_type = pkt.payload[0]
+        mapping = {
+            0: "photo_success",
+            1: "fail_photo_check_tf",
+        }
+        if info_type == 1:
+            raise RuntimeError(mapping[info_type])
+        return {"info_type": info_type, "message": mapping.get(info_type, f"feedback_{info_type}")}
 
     def toggle_record(self) -> Optional[Dict[str, Any]]:
         pkt = self.send(
@@ -324,11 +340,32 @@ class MT11UDPClient:
         }
         return {"info_type": info_type, "message": mapping.get(info_type, f"feedback_{info_type}")}
 
-    def set_motion_mode(self, mode: str) -> None:
+    def set_motion_mode(self, mode: str) -> Optional[Dict[str, Any]]:
         mode = mode.lower().strip()
         if mode not in ("lock", "follow", "fpv"):
             raise ValueError("mode must be lock, follow, or fpv")
         self.camera_function(f"{mode}_mode", wait_response=False)
+
+        working_mode = None
+        config_mode = None
+        for _ in range(4):
+            time.sleep(0.25)
+            working_mode = self.request_working_mode()
+            config = self.request_config() or {}
+            config_mode = config.get("motion_mode")
+            if working_mode == mode or config_mode == mode:
+                break
+
+        actual = working_mode or config_mode
+        if working_mode != mode and config_mode != mode and actual is not None:
+            raise RuntimeError(f"requested {mode}, camera reports {actual}")
+
+        return {
+            "requested": mode,
+            "working_mode": working_mode,
+            "config_mode": config_mode,
+            "verified": (working_mode == mode or config_mode == mode) if actual is not None else None,
+        }
 
     # Codec and image mode
 

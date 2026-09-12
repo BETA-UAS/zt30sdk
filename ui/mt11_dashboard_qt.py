@@ -15,6 +15,7 @@ import tempfile
 import threading
 import time
 import webbrowser
+from datetime import datetime
 from pathlib import Path
 from typing import Callable, Dict, Optional
 from urllib.parse import urlparse, urlunparse
@@ -73,9 +74,15 @@ DEFAULT_FPV_SOURCE_URL = os.environ.get("MT11_FPV_SOURCE_URL", "rtsp://192.168.1
 DEFAULT_FPV_RELAY_URL = os.environ.get("MT11_FPV_RELAY_URL", "rtsp://127.0.0.1:8554/cam2")
 FPV_RELAY_FALLBACK_PORT = int(os.environ.get("MT11_FPV_RELAY_FALLBACK_PORT", "8555"))
 FPV_RELAY_ENABLED_DEFAULT = os.environ.get("MT11_FPV_RELAY_ENABLED", "1").strip().lower() not in ("0", "false", "no", "off")
+FPV_RELAY_MODE_DEFAULT = os.environ.get("MT11_FPV_RELAY_MODE", "qgc_safe").strip().lower()
+FPV_RELAY_SAFE_FPS = int(os.environ.get("MT11_FPV_SAFE_FPS", "25"))
+FPV_RELAY_SAFE_BITRATE = os.environ.get("MT11_FPV_SAFE_BITRATE", "2500k")
+FPV_RELAY_SAFE_MAXRATE = os.environ.get("MT11_FPV_SAFE_MAXRATE", "3000k")
+FPV_RELAY_SAFE_BUFSIZE = os.environ.get("MT11_FPV_SAFE_BUFSIZE", "1000k")
 FPV_RELAY_MAX_DELAY_US = int(os.environ.get("MT11_FPV_MAX_DELAY_US", "250000"))
 FPV_RELAY_BUFFER_SIZE = int(os.environ.get("MT11_FPV_BUFFER_SIZE", "1048576"))
 FPV_RELAY_REORDER_QUEUE = int(os.environ.get("MT11_FPV_REORDER_QUEUE", "256"))
+STATUS_REFRESH_MS = int(os.environ.get("MT11_STATUS_REFRESH_MS", "1000"))
 LASER_RANGE_REFRESH_MS = int(os.environ.get("MT11_LASER_RANGE_REFRESH_MS", "1000"))
 LASER_TARGET_REFRESH_MS = int(os.environ.get("MT11_LASER_TARGET_REFRESH_MS", "5000"))
 SIMULATOR_MARKER = Path(os.environ.get("MT11_SIMULATOR_MARKER", Path.home() / ".mt11control_simulator"))
@@ -84,6 +91,7 @@ SIM_RTSP_BASE = os.environ.get("MT11_SIM_RTSP_BASE", "rtsp://127.0.0.1:8554")
 SIM_VIDEO1_URL = os.environ.get("MT11_SIM_VIDEO1_URL", f"{SIM_RTSP_BASE}/mt11sim1")
 SIM_VIDEO2_URL = os.environ.get("MT11_SIM_VIDEO2_URL", f"{SIM_RTSP_BASE}/mt11sim2")
 SIM_SAMPLE_VIDEO = Path(os.environ.get("MT11_SIM_SAMPLE_VIDEO", Path.home() / "Videos" / "sample.mp4")).expanduser()
+STREAM_RECORD_DIR = Path(os.environ.get("MT11_STREAM_RECORD_DIR", Path.home() / "Videos" / "MT11Control")).expanduser()
 
 CAMERA_VIEWS = {
     "Zoom + Thermal": "zoom_sub_thermal",
@@ -321,12 +329,14 @@ class FPVRelayManager:
         source_url_getter: Callable[[], str],
         output_url_getter: Callable[[], str],
         output_url_setter: Callable[[str], None],
+        mode_getter: Callable[[], str],
         log_callback: Callable[[str], None],
     ):
         self.parent = parent
         self.source_url_getter = source_url_getter
         self.output_url_getter = output_url_getter
         self.output_url_setter = output_url_setter
+        self.mode_getter = mode_getter
         self.log = log_callback
         self.mediamtx_process: Optional[subprocess.Popen] = None
         self.mediamtx_config_path: Optional[Path] = None
@@ -462,6 +472,7 @@ class FPVRelayManager:
             self.log("FPV relay: source URL is empty")
             return
 
+        mode = self.mode_getter().strip().lower()
         cmd = [
             self._ffmpeg_bin() or "ffmpeg",
             "-hide_banner",
@@ -472,7 +483,7 @@ class FPVRelayManager:
             "-flags",
             "low_delay",
             "-fflags",
-            "+discardcorrupt",
+            "+discardcorrupt+genpts",
             "-buffer_size",
             str(FPV_RELAY_BUFFER_SIZE),
             "-reorder_queue_size",
@@ -488,8 +499,46 @@ class FPVRelayManager:
             "-map",
             "0:v:0",
             "-an",
-            "-c:v",
-            "copy",
+        ]
+
+        if mode in ("raw", "copy", "low_latency", "low latency raw", "raw low latency"):
+            cmd.extend([
+                "-c:v",
+                "copy",
+            ])
+            mode_label = "raw low latency"
+        else:
+            cmd.extend([
+                "-vf",
+                f"fps={FPV_RELAY_SAFE_FPS},format=yuv420p",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "ultrafast",
+                "-tune",
+                "zerolatency",
+                "-profile:v",
+                "baseline",
+                "-level:v",
+                "4.0",
+                "-bf",
+                "0",
+                "-g",
+                str(FPV_RELAY_SAFE_FPS),
+                "-keyint_min",
+                str(FPV_RELAY_SAFE_FPS),
+                "-sc_threshold",
+                "0",
+                "-b:v",
+                FPV_RELAY_SAFE_BITRATE,
+                "-maxrate",
+                FPV_RELAY_SAFE_MAXRATE,
+                "-bufsize",
+                FPV_RELAY_SAFE_BUFSIZE,
+            ])
+            mode_label = "QGC safe"
+
+        cmd.extend([
             "-f",
             "rtsp",
             "-rtsp_transport",
@@ -499,7 +548,7 @@ class FPVRelayManager:
             "-muxpreload",
             "0",
             output_url,
-        ]
+        ])
 
         try:
             self.ffmpeg_process = subprocess.Popen(
@@ -507,7 +556,7 @@ class FPVRelayManager:
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
-            self.log(f"FPV relay: publishing {source_url} -> {output_url}")
+            self.log(f"FPV relay: publishing {source_url} -> {output_url} ({mode_label})")
         except Exception as exc:
             self.log(f"FPV relay: failed to start ffmpeg: {exc}")
             self._schedule_ffmpeg_restart()
@@ -1017,7 +1066,7 @@ class VideoStage(QFrame):
         self._main_pixmap: Optional[QPixmap] = None
         self._pip_pixmap: Optional[QPixmap] = None
         self._laser_overlay_lines = []
-        self._ai_tracking_box: Optional[AITrackingBox] = None
+        self._status_overlay_lines = []
         self._selection_start: Optional[tuple[int, int]] = None
         self._selection_end: Optional[tuple[int, int]] = None
         self._thermal_measurement = None
@@ -1056,9 +1105,12 @@ class VideoStage(QFrame):
         self._laser_overlay_lines = []
         self._refresh_pixmaps()
 
-    def set_ai_tracking_box(self, box: Optional[AITrackingBox]):
-        self._ai_tracking_box = box
+    def set_status_overlay(self, lines):
+        self._status_overlay_lines = [line for line in lines if line]
         self._refresh_pixmaps()
+
+    def set_ai_tracking_box(self, box: Optional[AITrackingBox]):
+        return
 
     def set_thermal_measurement(self, measurement):
         self._thermal_measurement = measurement
@@ -1136,14 +1188,27 @@ class VideoStage(QFrame):
                 painter.drawText(rect.x() + 11, y, line)
                 y += line_height
 
+        if self._status_overlay_lines:
+            painter.setFont(QFont("Inter", 10, QFont.DemiBold))
+            metrics = painter.fontMetrics()
+            line_height = metrics.height()
+            width = max(metrics.horizontalAdvance(line) for line in self._status_overlay_lines) + 22
+            height = line_height * len(self._status_overlay_lines) + 18
+            rect = QRect(max(14, pixmap.width() - width - 14), 14, width, height)
+            painter.fillRect(rect, QColor(3, 5, 7, 185))
+            painter.setPen(QPen(QColor("#f7d84a"), 1))
+            painter.drawRect(rect)
+            painter.setPen(QPen(QColor("#eef3f7"), 1))
+            y = rect.y() + 12 + metrics.ascent()
+            for line in self._status_overlay_lines:
+                painter.drawText(rect.x() + 11, y, line)
+                y += line_height
+
         if self._selection_start and self._selection_end:
             self._draw_selection_box(painter, pixmap)
 
         if self._thermal_measurement:
             self._draw_thermal_measurement(painter, pixmap, self._thermal_measurement)
-
-        if self._ai_tracking_box:
-            self._draw_ai_tracking_box(painter, pixmap, self._ai_tracking_box)
 
         painter.end()
 
@@ -1177,22 +1242,6 @@ class VideoStage(QFrame):
         painter.drawRect(rect)
         marker(data["max_x"], data["max_y"], f'MAX {data["max_c"]:.1f} °C', QColor("#ff5252"))
         marker(data["min_x"], data["min_y"], f'MIN {data["min_c"]:.1f} °C', QColor("#40c4ff"))
-
-    def _draw_ai_tracking_box(self, painter: QPainter, pixmap: QPixmap, box: AITrackingBox):
-        scale_x = pixmap.width() / AI_COORD_SIZE[0]
-        scale_y = pixmap.height() / AI_COORD_SIZE[1]
-
-        left = clamp(round(box.left * scale_x), 0, pixmap.width() - 1)
-        top = clamp(round(box.top * scale_y), 0, pixmap.height() - 1)
-        right = clamp(round(box.right * scale_x), 0, pixmap.width() - 1)
-        bottom = clamp(round(box.bottom * scale_y), 0, pixmap.height() - 1)
-
-        rect = QRect(left, top, max(2, right - left), max(2, bottom - top))
-        painter.setPen(QPen(QColor(0, 0, 0, 210), 5))
-        painter.drawRect(rect)
-        color = QColor("#2fd16d") if box.track_state in (0, 4) else QColor("#f7d84a")
-        painter.setPen(QPen(color, 3))
-        painter.drawRect(rect)
 
     def _draw_selection_box(self, painter: QPainter, pixmap: QPixmap):
         left, top, right, bottom = self._normalized_selection()
@@ -1324,6 +1373,7 @@ class MT11QtDashboard(QMainWindow):
     ai_status_signal = pyqtSignal(str)
     media_list_signal = pyqtSignal(object, object)
     record_status_signal = pyqtSignal(str)
+    stream_record_status_signal = pyqtSignal(str, object)
     thermal_result_signal = pyqtSignal(object)
 
     def __init__(self):
@@ -1355,11 +1405,20 @@ class MT11QtDashboard(QMainWindow):
         self.laser_target = None
         self.last_laser_target_refresh = 0.0
         self.last_selected_ai_box: Optional[AITrackingBox] = None
+        self.ai_tracking_prepared = False
+        self.ai_overlay_stream_enabled = False
+        self.ai_command_size_cache = AI_COORD_SIZE
+        self.ai_command_size_cache_source = ""
+        self.ai_command_size_cache_time = 0.0
+        self.ai_track_request_id = 0
+        self.ai_track_request_lock = threading.Lock()
         self.current_media_type = 0
         self.media_items = []
         self._updating_sources = False
         self.recording = False
         self.record_command_pending = False
+        self.stream_record_process: Optional[subprocess.Popen] = None
+        self.stream_record_file: Optional[Path] = None
         self.status_refresh_pending = False
         self.laser_refresh_pending = False
         self.video_render_pending = False
@@ -1377,6 +1436,7 @@ class MT11QtDashboard(QMainWindow):
             lambda: self.fpv_source_edit.text(),
             lambda: self.fpv_relay_url_edit.text(),
             self.fpv_relay_url_edit.setText,
+            lambda: self.fpv_mode_combo.currentText(),
             self.log_message,
         )
         self.stream_simulator = RTSPStreamSimulator(
@@ -1392,6 +1452,7 @@ class MT11QtDashboard(QMainWindow):
         self.ai_status_signal.connect(self._apply_ai_status)
         self.media_list_signal.connect(self._apply_media_list)
         self.record_status_signal.connect(self._apply_record_status)
+        self.stream_record_status_signal.connect(self._apply_stream_record_status)
         self.thermal_result_signal.connect(self._apply_thermal_result)
 
         self._ensure_client()
@@ -1399,7 +1460,7 @@ class MT11QtDashboard(QMainWindow):
 
         self.telemetry_timer = QTimer(self)
         self.telemetry_timer.timeout.connect(self.refresh_status)
-        self.telemetry_timer.start(2500)
+        self.telemetry_timer.start(STATUS_REFRESH_MS)
 
         self.laser_timer = QTimer(self)
         self.laser_timer.timeout.connect(self.refresh_laser_overlay)
@@ -1582,6 +1643,10 @@ class MT11QtDashboard(QMainWindow):
         self.fpv_relay_url_edit = QLineEdit(DEFAULT_FPV_RELAY_URL)
         self.fpv_relay_url_edit.setMinimumWidth(180)
 
+        self.fpv_mode_combo = QComboBox()
+        self.fpv_mode_combo.addItems(["QGC Safe", "Raw Low Latency"])
+        self.fpv_mode_combo.setCurrentText("Raw Low Latency" if FPV_RELAY_MODE_DEFAULT in ("raw", "copy", "low_latency") else "QGC Safe")
+
         self.simulator_check = QCheckBox("Use local stream simulator")
         self.simulator_check.setChecked(False)
         self.simulator_check.setVisible(SIMULATOR_AVAILABLE)
@@ -1599,36 +1664,55 @@ class MT11QtDashboard(QMainWindow):
         grid.addWidget(self.fpv_source_edit, 3, 1, 1, 2)
         grid.addWidget(QLabel("FPV Output"), 4, 0)
         grid.addWidget(self.fpv_relay_url_edit, 4, 1, 1, 2)
+        grid.addWidget(QLabel("FPV Mode"), 5, 0)
+        grid.addWidget(self.fpv_mode_combo, 5, 1, 1, 2)
 
-        grid.addWidget(self.simulator_check, 5, 0, 1, 3)
+        grid.addWidget(self.simulator_check, 6, 0, 1, 3)
 
-        grid.addWidget(connect_play, 6, 1, 1, 2)
+        grid.addWidget(connect_play, 7, 1, 1, 2)
 
         box.layout().addLayout(grid)
         return box
 
     def _build_quick_actions(self):
         box = self._section("Quick Actions")
-        row = QHBoxLayout()
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(8)
+        grid.setVerticalSpacing(8)
 
         photo = QPushButton("Photo")
         photo.clicked.connect(lambda: self.run_command("photo", self.client.take_photo))
 
-        self.record_button = QPushButton("Start Record")
+        self.record_button = QPushButton("Cam Rec")
         self.record_button.clicked.connect(self.toggle_record)
+        self.record_button.setToolTip("Start/stop camera TF-card recording")
 
-        self.record_indicator = QLabel("● NOT RECORDING")
+        self.record_indicator = QLabel("CAM: OFF")
         self.record_indicator.setObjectName("recordIndicator")
 
-        focus = QPushButton("Auto Focus")
+        self.stream_record_button = QPushButton("Stream Rec")
+        self.stream_record_button.clicked.connect(self.toggle_stream_recording)
+        self.stream_record_button.setToolTip("Record the currently displayed RTSP stream locally")
+
+        self.stream_record_indicator = QLabel("STREAM: OFF")
+        self.stream_record_indicator.setObjectName("recordIndicator")
+
+        focus = QPushButton("AF")
+        focus.setToolTip("Auto focus")
         focus.clicked.connect(lambda: self.run_command("auto focus", self.client.auto_focus))
 
-        row.addWidget(photo)
-        row.addWidget(self.record_button)
-        row.addWidget(focus)
+        for button in (photo, self.record_button, self.stream_record_button, focus):
+            button.setMinimumWidth(0)
+            button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
-        box.layout().addLayout(row)
+        grid.addWidget(photo, 0, 0)
+        grid.addWidget(focus, 0, 1)
+        grid.addWidget(self.record_button, 1, 0)
+        grid.addWidget(self.stream_record_button, 1, 1)
+
+        box.layout().addLayout(grid)
         box.layout().addWidget(self.record_indicator)
+        box.layout().addWidget(self.stream_record_indicator)
         return box
 
     def _build_gimbal_controls(self):
@@ -2064,6 +2148,11 @@ class MT11QtDashboard(QMainWindow):
                 self.ai_client.close()
             except Exception:
                 pass
+        self.ai_tracking_prepared = False
+        self.ai_overlay_stream_enabled = False
+        self.ai_command_size_cache = AI_COORD_SIZE
+        self.ai_command_size_cache_source = ""
+        self.ai_command_size_cache_time = 0.0
 
         try:
             self.ai_client = MT11AITrackingClient(host, port)
@@ -2184,6 +2273,7 @@ class MT11QtDashboard(QMainWindow):
             self.video_stage.set_pip_frame(pip_frame)
 
     def stop_streams(self):
+        self._stop_stream_recording("stream stopped")
         self.streams_requested = False
         self.stream_restart_pending = {"primary": False, "video2": False}
 
@@ -2701,20 +2791,33 @@ class MT11QtDashboard(QMainWindow):
         else:
             self.cancel_ai_tracking()
 
-    def track_ai_point(self, x: int, y: int):
-        self.ai_tracking_signal.emit(None)
-        overlay_enabled = self.ai_overlay_check.isChecked()
-        self.run_ai_command("AI track point", lambda: self._track_ai_point_worker(x, y, overlay_enabled))
+    def _next_ai_track_request_id(self) -> int:
+        with self.ai_track_request_lock:
+            self.ai_track_request_id += 1
+            return self.ai_track_request_id
 
-    def _track_ai_point_worker(self, x: int, y: int, overlay_enabled: bool):
+    def _is_current_ai_track_request(self, request_id: int) -> bool:
+        with self.ai_track_request_lock:
+            return request_id == self.ai_track_request_id
+
+    def track_ai_point(self, x: int, y: int):
+        request_id = self._next_ai_track_request_id()
+        overlay_enabled = self.ai_overlay_check.isChecked()
+        self.ai_status_signal.emit(f"AI: retarget point | {x},{y}")
+        self.run_ai_command("AI track point", lambda: self._track_ai_point_worker(request_id, x, y, overlay_enabled))
+
+    def _track_ai_point_worker(self, request_id: int, x: int, y: int, overlay_enabled: bool):
         recognition = self._prepare_ai_track()
         cmd_x, cmd_y = self._ai_to_track_command_point(x, y)
+        if not self._is_current_ai_track_request(request_id):
+            return {"status": "superseded", "overlay_xy": (x, y), "command_xy": (cmd_x, cmd_y)}
+        handoff = self._handoff_active_ai_track(request_id)
         result = self.ai_client.track_point(cmd_x, cmd_y)
-        if overlay_enabled:
-            time.sleep(0.10)
+        if overlay_enabled and self._is_current_ai_track_request(request_id) and not self.ai_overlay_stream_enabled:
             self._start_ai_overlay_worker()
         return {
             "recognition": recognition,
+            "handoff": handoff,
             "track_result": result,
             "status": self.ai_client.describe_select_status(result),
             "overlay_xy": (x, y),
@@ -2731,55 +2834,76 @@ class MT11QtDashboard(QMainWindow):
             ).start()
             return
         self.last_selected_ai_box = None
-        self.ai_tracking_signal.emit(None)
-        self.ai_status_signal.emit(f"AI: ROI sent | {left},{top} - {right},{bottom}")
+        request_id = self._next_ai_track_request_id()
+        self.ai_status_signal.emit(f"AI: retarget ROI | {left},{top} - {right},{bottom}")
         overlay_enabled = self.ai_overlay_check.isChecked()
         self.run_ai_command(
             "AI track box",
-            lambda: self._track_ai_box_worker(left, top, right, bottom, overlay_enabled),
+            lambda: self._track_ai_box_worker(request_id, left, top, right, bottom, overlay_enabled),
         )
 
-    def _track_ai_box_worker(self, left: int, top: int, right: int, bottom: int, overlay_enabled: bool):
+    def _track_ai_box_worker(self, request_id: int, left: int, top: int, right: int, bottom: int, overlay_enabled: bool):
         recognition = self._prepare_ai_track()
         left, top, right, bottom = self._expanded_ai_box(left, top, right, bottom)
         cmd_left, cmd_top, cmd_right, cmd_bottom = self._ai_to_track_command_box(left, top, right, bottom)
+        if not self._is_current_ai_track_request(request_id):
+            return {
+                "status": "superseded",
+                "overlay_box": (left, top, right, bottom),
+                "command_box": (cmd_left, cmd_top, cmd_right, cmd_bottom),
+            }
+        handoff = self._handoff_active_ai_track(request_id)
         result = self.ai_client.track_box(cmd_left, cmd_top, cmd_right, cmd_bottom)
-        if overlay_enabled:
-            time.sleep(0.10)
+        if overlay_enabled and self._is_current_ai_track_request(request_id) and not self.ai_overlay_stream_enabled:
             self._start_ai_overlay_worker()
         return {
             "recognition": recognition,
+            "handoff": handoff,
             "track_result": result,
             "status": self.ai_client.describe_select_status(result),
             "overlay_box": (left, top, right, bottom),
             "command_box": (cmd_left, cmd_top, cmd_right, cmd_bottom),
         }
 
-    def _prepare_ai_track(self):
+    def _handoff_active_ai_track(self, request_id: int) -> Optional[int]:
+        if not self._is_current_ai_track_request(request_id):
+            return None
         try:
             self.ai_client.stop_coordinate_listener()
-        except Exception:
-            pass
-        try:
             self.ai_client.set_coordinate_stream_enabled(False)
-        except Exception:
-            pass
-        try:
-            self.ai_client.cancel_tracking()
-        except Exception:
-            pass
-        time.sleep(0.15)
+            self.ai_overlay_stream_enabled = False
+            result = self.ai_client.cancel_tracking()
+            time.sleep(0.12)
+            return result
+        except Exception as exc:
+            self.log_message(f"AI retarget handoff: {exc}")
+            return None
+
+    def _prepare_ai_track(self):
+        if self.ai_tracking_prepared:
+            return True
         try:
             self.ai_client.set_rtsp_stream_enabled(True)
         except Exception:
             pass
-        return self.ai_client.set_recognition_enabled(True)
+        result = self.ai_client.set_recognition_enabled(True)
+        self.ai_tracking_prepared = result is not False
+        return result
 
     def _track_command_size(self) -> tuple[int, int]:
+        source = self.main_source_combo.currentText() if hasattr(self, "main_source_combo") else "Video 1"
+        now = time.monotonic()
+        if (
+            self.ai_command_size_cache_source == source
+            and now - self.ai_command_size_cache_time < 10.0
+            and self.ai_command_size_cache[0] > 0
+            and self.ai_command_size_cache[1] > 0
+        ):
+            return self.ai_command_size_cache
+
         if not self.client and not self._ensure_client():
             return AI_COORD_SIZE
 
-        source = self.main_source_combo.currentText() if hasattr(self, "main_source_combo") else "Video 1"
         stream_type = 2 if source == "Video 2" else 1
 
         try:
@@ -2790,7 +2914,10 @@ class MT11QtDashboard(QMainWindow):
 
         if not specs or specs.width <= 0 or specs.height <= 0:
             return AI_COORD_SIZE
-        return specs.width, specs.height
+        self.ai_command_size_cache = (specs.width, specs.height)
+        self.ai_command_size_cache_source = source
+        self.ai_command_size_cache_time = now
+        return self.ai_command_size_cache
 
     def _ai_to_track_command_point(self, x: int, y: int) -> tuple[int, int]:
         width, height = self._track_command_size()
@@ -2804,8 +2931,24 @@ class MT11QtDashboard(QMainWindow):
         cmd_right, cmd_bottom = self._ai_to_track_command_point(right, bottom)
         return min(cmd_left, cmd_right), min(cmd_top, cmd_bottom), max(cmd_left, cmd_right), max(cmd_top, cmd_bottom)
 
+    def _tracking_box_to_overlay(self, box: AITrackingBox) -> AITrackingBox:
+        width, height = self.ai_command_size_cache
+        if (width, height) == AI_COORD_SIZE or width <= 0 or height <= 0:
+            return box
+
+        scale_x = (AI_COORD_SIZE[0] - 1) / max(1, width - 1)
+        scale_y = (AI_COORD_SIZE[1] - 1) / max(1, height - 1)
+        return AITrackingBox(
+            clamp(round(box.x * scale_x), 0, AI_COORD_SIZE[0] - 1),
+            clamp(round(box.y * scale_y), 0, AI_COORD_SIZE[1] - 1),
+            clamp(round(box.width * scale_x), 0, AI_COORD_SIZE[0] - 1),
+            clamp(round(box.height * scale_y), 0, AI_COORD_SIZE[1] - 1),
+            box.target_id,
+            box.track_state,
+        )
+
     @staticmethod
-    def _expanded_ai_box(left: int, top: int, right: int, bottom: int, min_size: int = 120) -> tuple[int, int, int, int]:
+    def _expanded_ai_box(left: int, top: int, right: int, bottom: int, min_size: int = 24) -> tuple[int, int, int, int]:
         left, right = sorted((clamp(left, 0, AI_COORD_SIZE[0] - 1), clamp(right, 0, AI_COORD_SIZE[0] - 1)))
         top, bottom = sorted((clamp(top, 0, AI_COORD_SIZE[1] - 1), clamp(bottom, 0, AI_COORD_SIZE[1] - 1)))
         width = max(2, right - left)
@@ -2841,6 +2984,8 @@ class MT11QtDashboard(QMainWindow):
         )
 
     def cancel_ai_tracking(self):
+        self._next_ai_track_request_id()
+        self.video_stage.set_ai_tracking_box(None)
         self.run_ai_command("AI cancel tracking", self._cancel_ai_tracking_worker)
 
     def _cancel_ai_tracking_worker(self):
@@ -2849,6 +2994,7 @@ class MT11QtDashboard(QMainWindow):
             self.ai_client.set_coordinate_stream_enabled(False)
         except Exception:
             pass
+        self.ai_overlay_stream_enabled = False
         result = self.ai_client.cancel_tracking()
         self.last_selected_ai_box = None
         self.ai_tracking_signal.emit(None)
@@ -2862,11 +3008,14 @@ class MT11QtDashboard(QMainWindow):
             self.run_ai_command("AI overlay off", self._stop_ai_overlay_worker)
 
     def _start_ai_overlay_worker(self):
+        if self.ai_overlay_stream_enabled:
+            return True
         stream_enabled = self.ai_client.set_coordinate_stream_enabled(True)
         self.ai_client.start_coordinate_listener(
             lambda box: self.ai_tracking_signal.emit(box),
             lambda exc: self.log_message(f"AI overlay listener: ERROR {exc}"),
         )
+        self.ai_overlay_stream_enabled = stream_enabled is not False
         return stream_enabled
 
     def _stop_ai_overlay_worker(self):
@@ -2875,17 +3024,17 @@ class MT11QtDashboard(QMainWindow):
         finally:
             self.ai_client.stop_coordinate_listener()
             self.ai_tracking_signal.emit(None)
+            self.ai_overlay_stream_enabled = False
         return stream_enabled
 
     def _apply_ai_tracking_box(self, box):
         if box and hasattr(self, "ai_status_label"):
+            box = self._tracking_box_to_overlay(box)
             if self._is_full_frame_ai_box(box):
-                self.video_stage.set_ai_tracking_box(None)
                 self.last_selected_ai_box = None
                 self.ai_status_label.setText(f"AI: tracking full frame | {box.x},{box.y}")
                 return
 
-            self.video_stage.set_ai_tracking_box(box)
             self.last_selected_ai_box = box
 
             if box.target_id == 255:
@@ -2893,7 +3042,6 @@ class MT11QtDashboard(QMainWindow):
             else:
                 self.ai_status_label.setText(f"AI: {box.target_type} | {box.state} | {box.x},{box.y}")
         elif box is None:
-            self.video_stage.set_ai_tracking_box(None)
             self.last_selected_ai_box = None
 
     def _apply_ai_status(self, text: str):
@@ -2933,6 +3081,112 @@ class MT11QtDashboard(QMainWindow):
         except Exception as exc:
             self.log_message(f"{label}: ERROR {exc}")
 
+    def _stream_recording_active(self) -> bool:
+        return self.stream_record_process is not None and self.stream_record_process.poll() is None
+
+    def toggle_stream_recording(self):
+        if self._stream_recording_active():
+            self._stop_stream_recording("manual stop")
+        else:
+            self._start_stream_recording()
+
+    def _start_stream_recording(self):
+        if self._stream_recording_active():
+            return
+        if not self.streams_requested:
+            self.log_message("stream record: start Connect + Play first")
+            return
+        ffmpeg = shutil.which("ffmpeg")
+        if not ffmpeg:
+            self.log_message("stream record: ffmpeg not found")
+            self.stream_record_status_signal.emit("error", "ffmpeg not found")
+            return
+
+        try:
+            source = self._source_spec(self.main_source_combo.currentText())
+            STREAM_RECORD_DIR.mkdir(parents=True, exist_ok=True)
+            source_name = "".join(ch if ch.isalnum() else "_" for ch in source["name"].lower()).strip("_")
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            output = STREAM_RECORD_DIR / f"{source_name}_{timestamp}.mkv"
+            cmd = [
+                ffmpeg,
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "warning",
+                "-rtsp_transport",
+                source["transport"],
+                "-i",
+                source["url"],
+                "-map",
+                "0:v:0",
+                "-an",
+                "-c:v",
+                "copy",
+                str(output),
+            ]
+            process = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            self.stream_record_process = process
+            self.stream_record_file = output
+            self.stream_record_status_signal.emit("on", output)
+            threading.Thread(target=self._monitor_stream_recording, args=(process, output), daemon=True).start()
+            self.log_message(f"stream record: writing {output}")
+        except Exception as exc:
+            self.log_message(f"stream record: ERROR {exc}")
+            self.stream_record_status_signal.emit("error", str(exc))
+
+    def _monitor_stream_recording(self, process: subprocess.Popen, output: Path):
+        code = process.wait()
+        if self.stream_record_process is process:
+            self.stream_record_process = None
+            status = "off" if code == 0 else "error"
+            self.stream_record_status_signal.emit(status, {"file": output, "code": code})
+            if code == 0:
+                self.log_message(f"stream record: saved {output}")
+            else:
+                self.log_message(f"stream record: ffmpeg exited with code {code}")
+
+    def _stop_stream_recording(self, reason: str = "stop"):
+        process = self.stream_record_process
+        if not process:
+            return
+        output = self.stream_record_file
+        self.stream_record_process = None
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=4)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=2)
+        self.stream_record_status_signal.emit("off", {"file": output, "reason": reason})
+        if output:
+            self.log_message(f"stream record: stopped ({reason}), saved {output}")
+
+    def _apply_stream_record_status(self, status: str, detail):
+        if status == "on":
+            self.stream_record_button.setText("Stop Stream")
+            if detail:
+                self.stream_record_indicator.setToolTip(str(detail))
+            self.stream_record_indicator.setText("STREAM: REC")
+            self.stream_record_indicator.setProperty("recording", True)
+        elif status == "error":
+            self.stream_record_button.setText("Stream Rec")
+            self.stream_record_indicator.setToolTip(str(detail) if detail else "")
+            self.stream_record_indicator.setText("STREAM: ERROR")
+            self.stream_record_indicator.setProperty("recording", False)
+        else:
+            self.stream_record_button.setText("Stream Rec")
+            filename = None
+            if isinstance(detail, dict) and detail.get("file"):
+                filename = Path(detail["file"]).name
+                self.stream_record_indicator.setToolTip(str(detail["file"]))
+            self.stream_record_indicator.setText("STREAM: SAVED" if filename else "STREAM: OFF")
+            self.stream_record_indicator.setProperty("recording", False)
+
+        self.stream_record_indicator.style().unpolish(self.stream_record_indicator)
+        self.stream_record_indicator.style().polish(self.stream_record_indicator)
+
     def toggle_record(self):
         if self.record_command_pending:
             return
@@ -2942,7 +3196,7 @@ class MT11QtDashboard(QMainWindow):
 
         self.record_command_pending = True
         self.record_button.setEnabled(False)
-        self.record_indicator.setText("● CHECKING RECORD STATUS")
+        self.record_indicator.setText("CAM: CHECK")
         threading.Thread(target=self._toggle_record_worker, daemon=True).start()
 
     def _toggle_record_worker(self):
@@ -2957,13 +3211,18 @@ class MT11QtDashboard(QMainWindow):
                 return
 
             self.log_message(f"record {action}: camera feedback {feedback['info_type']}")
-            if action == "start" and feedback["info_type"] == 5:
+            time.sleep(0.25)
+            config = self.client.request_config() or {}
+            config_status = config.get("record")
+            if config_status in ("on", "off", "tf_empty", "tf_data_loss"):
+                self.record_status_signal.emit(config_status)
+            elif action == "start" and feedback["info_type"] == 5:
                 self.record_status_signal.emit("on")
             elif action == "stop" and feedback["info_type"] == 6:
                 self.record_status_signal.emit("off")
             else:
-                # Do not show a false stopped state. Firmware v0.2.8 on the
-                # tested device returned 5 again for a requested stop.
+                # Do not show a false stopped state. Some firmware can return
+                # the last record feedback again while it is still settling.
                 self.record_status_signal.emit("unknown")
         except Exception as exc:
             self.log_message(f"record {action}: ERROR {exc}")
@@ -2975,26 +3234,26 @@ class MT11QtDashboard(QMainWindow):
 
         if status == "on":
             self.recording = True
-            self.record_button.setText("Stop Record")
-            self.record_indicator.setText("● RECORDING")
+            self.record_button.setText("Stop Cam")
+            self.record_indicator.setText("CAM: REC")
             self.record_indicator.setProperty("recording", True)
         elif status == "off":
             self.recording = False
-            self.record_button.setText("Start Record")
-            self.record_indicator.setText("● NOT RECORDING")
+            self.record_button.setText("Cam Rec")
+            self.record_indicator.setText("CAM: OFF")
             self.record_indicator.setProperty("recording", False)
         elif status == "tf_empty":
             self.recording = False
-            self.record_button.setText("Start Record")
-            self.record_indicator.setText("● TF CARD NOT AVAILABLE")
+            self.record_button.setText("Cam Rec")
+            self.record_indicator.setText("CAM: NO TF")
             self.record_indicator.setProperty("recording", False)
         elif status == "tf_data_loss":
             self.recording = False
-            self.record_button.setText("Start Record")
-            self.record_indicator.setText("● TF CARD DATA ERROR")
+            self.record_button.setText("Cam Rec")
+            self.record_indicator.setText("CAM: TF ERR")
             self.record_indicator.setProperty("recording", False)
         else:
-            self.record_indicator.setText("● RECORD STATUS UNKNOWN")
+            self.record_indicator.setText("CAM: UNKNOWN")
             self.record_indicator.setProperty("recording", False)
 
         # Dynamic Qt properties require an explicit style refresh.
@@ -3071,13 +3330,22 @@ class MT11QtDashboard(QMainWindow):
             self.status_refresh_pending = False
 
     def _apply_telemetry(self, attitude, zoom):
+        overlay_lines = []
         if attitude:
             self.yaw_value[1].setText(f"{attitude['yaw_deg']:.1f}")
             self.pitch_value[1].setText(f"{attitude['pitch_deg']:.1f}")
             self.roll_value[1].setText(f"{attitude['roll_deg']:.1f}")
+            overlay_lines.extend([
+                f"Pan {attitude['yaw_deg']:.1f} deg",
+                f"Tilt {attitude['pitch_deg']:.1f} deg",
+            ])
 
         if zoom is not None:
             self.zoom_value[1].setText(f"{zoom:.1f}x")
+            overlay_lines.insert(0, f"Zoom {zoom:.1f}x")
+
+        if overlay_lines:
+            self.video_stage.set_status_overlay(overlay_lines)
 
     def toggle_joystick(self, enabled: bool):
         if enabled:
