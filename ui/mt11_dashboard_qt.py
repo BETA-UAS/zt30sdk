@@ -61,8 +61,9 @@ from mt11_sdk.constants import IMAGE_MODE_BY_NAME, IMAGE_MODES, THERMAL_PALETTES
 
 STREAM_SIZE = (960, 540)
 PIP_STREAM_SIZE = (480, 270)
-MAIN_STREAM_FPS = 15
+MAIN_STREAM_FPS = 24
 PIP_STREAM_FPS = 8
+VIDEO_RENDER_INTERVAL_MS = max(1, round(1000 / MAIN_STREAM_FPS))
 PIP_SIZE_DEFAULT = (320, 180)
 AI_COORD_SIZE = (1280, 720)
 THERMAL_COORD_SIZE = (640, 512)
@@ -205,7 +206,7 @@ class FFmpegStreamThread(QThread):
                 bufsize=frame_bytes * 2,
             )
 
-            self.status_changed.emit("Live")
+            got_frame = False
 
             while self._running and self._process.stdout is not None:
                 try:
@@ -216,6 +217,9 @@ class FFmpegStreamThread(QThread):
                     break
 
                 if frame is None:
+                    if self._running:
+                        self.error.emit(f"{self.name}: disconnected")
+                        self.stalled.emit(self.name)
                     break
 
                 image = QImage(
@@ -231,6 +235,10 @@ class FFmpegStreamThread(QThread):
                         f"ignored unexpected frame size {image.width()}x{image.height()}"
                     )
                     continue
+
+                if not got_frame:
+                    got_frame = True
+                    self.status_changed.emit("Live")
 
                 self.frame_ready.emit(image)
 
@@ -814,6 +822,9 @@ class MT11QtDashboard(QMainWindow):
         self.status_refresh_pending = False
         self.laser_refresh_pending = False
         self.video_render_pending = False
+        self.streams_requested = False
+        self.stream_restart_pending = {"primary": False, "video2": False}
+        self.stream_reconnect_attempts = {"primary": 0, "video2": 0}
         self.thermal_tool_enabled = False
         self.pre_thermal_source = None
         self.pre_thermal_view = None
@@ -842,7 +853,7 @@ class MT11QtDashboard(QMainWindow):
         self.laser_timer.start(4000)
 
         # Coalesce incoming frames. Without this limiter, two streams can queue
-        # 30-40 full UI redraws per second on low-power field computers.
+        # more redraws than the UI can present cleanly on field computers.
         self.video_render_timer = QTimer(self)
         self.video_render_timer.setSingleShot(True)
         self.video_render_timer.timeout.connect(self._flush_video_render)
@@ -1504,6 +1515,9 @@ class MT11QtDashboard(QMainWindow):
         self.primary_frame = None
         self.video2_frame = None
         self.primary_on_main = True
+        self.streams_requested = True
+        self.stream_restart_pending = {"primary": False, "video2": False}
+        self.stream_reconnect_attempts = {"primary": 0, "video2": 0}
 
         self.main_thread = self._start_stream(
             primary_source["url"],
@@ -1551,11 +1565,13 @@ class MT11QtDashboard(QMainWindow):
     def _handle_source_frame(self, source: str, image: QImage):
         if source == "primary":
             self.primary_frame = image
+            self.stream_reconnect_attempts["primary"] = 0
         elif source == "video2":
             self.video2_frame = image
+            self.stream_reconnect_attempts["video2"] = 0
         self.video_render_pending = True
         if not self.video_render_timer.isActive():
-            self.video_render_timer.start(66)
+            self.video_render_timer.start(VIDEO_RENDER_INTERVAL_MS)
 
     def _flush_video_render(self):
         if not self.video_render_pending:
@@ -1576,6 +1592,9 @@ class MT11QtDashboard(QMainWindow):
             self.video_stage.set_pip_frame(pip_frame)
 
     def stop_streams(self):
+        self.streams_requested = False
+        self.stream_restart_pending = {"primary": False, "video2": False}
+
         if self.main_thread:
             self.main_thread.stop()
             self.main_thread = None
@@ -1596,18 +1615,59 @@ class MT11QtDashboard(QMainWindow):
             self._set_ai_rtsp_enabled(False)
 
     def _handle_stream_stalled(self, name: str):
-        if name != "video2":
+        if name not in ("primary", "video2") or not self.streams_requested:
             return
 
-        self.log_message("video2 stream stalled: restarting PiP")
-        QTimer.singleShot(250, self._restart_pip_stream)
+        if name == "video2" and not self.pip_check.isChecked():
+            return
+
+        if self.stream_restart_pending.get(name):
+            return
+
+        self.stream_reconnect_attempts[name] = self.stream_reconnect_attempts.get(name, 0) + 1
+        delay_ms = min(5000, 250 * (2 ** min(self.stream_reconnect_attempts[name], 5)))
+        self.stream_restart_pending[name] = True
+        self.log_message(f"{name} stream lost: reconnecting in {delay_ms / 1000:.1f}s")
+        QTimer.singleShot(delay_ms, lambda stream_name=name: self._restart_stream(stream_name))
+
+    def _restart_stream(self, name: str):
+        self.stream_restart_pending[name] = False
+
+        if not self.streams_requested:
+            return
+
+        if name == "primary":
+            if self.main_thread:
+                self.main_thread.stop()
+                self.main_thread = None
+
+            try:
+                primary_source = self._source_spec(self.main_source_combo.currentText())
+            except Exception as exc:
+                self.log_message(f"primary restart: ERROR {exc}")
+                return
+
+            self.primary_frame = None
+            self._render_video_layout()
+            self.main_thread = self._start_stream(
+                primary_source["url"],
+                *STREAM_SIZE,
+                lambda image: self._handle_source_frame("primary", image),
+                transport=primary_source["transport"],
+                name="primary",
+                fps=MAIN_STREAM_FPS,
+            )
+            return
+
+        if name == "video2":
+            self._restart_pip_stream()
 
     def _restart_pip_stream(self):
         if self.pip_thread:
             self.pip_thread.stop()
             self.pip_thread = None
 
-        if not self.main_thread:
+        if not self.streams_requested or not self.pip_check.isChecked():
             return
 
         try:
