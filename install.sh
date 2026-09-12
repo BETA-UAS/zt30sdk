@@ -49,6 +49,10 @@ if command -v ffmpeg >/dev/null 2>&1; then
   cp "$(command -v ffmpeg)" "${APPDIR}/usr/bin/ffmpeg" || true
 fi
 
+if command -v mediamtx >/dev/null 2>&1; then
+  cp "$(command -v mediamtx)" "${APPDIR}/usr/bin/mediamtx" || true
+fi
+
 cat > "${APPDIR}/AppRun" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail

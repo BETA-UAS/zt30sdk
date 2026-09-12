@@ -10,6 +10,8 @@ SDK UDP port  : 37260
 RTSP main     : rtsp://192.168.144.25:8554/video1
 RTSP sub      : rtsp://192.168.144.25:8554/video2
 Web media     : http://192.168.144.25:82
+FPV relay in  : rtsp://192.168.144.26:554/
+FPV relay out : rtsp://127.0.0.1:8554/cam2
 ```
 
 ## Implemented Features
@@ -25,6 +27,7 @@ Web media     : http://192.168.144.25:82
 - MT11 built-in AI tracking and tracking box stream
 - MT11 media web API browsing and downloads
 - PyQt5 live RTSP dashboard with joystick support
+- Optional FPV RTSP relay through MediaMTX for QGroundControl/client reuse
 
 ## Setup
 
@@ -32,6 +35,8 @@ Web media     : http://192.168.144.25:82
 ./setup.sh
 ./run_mt11control.sh
 ```
+
+`setup.sh` checks for `ffmpeg` and `mediamtx`. The FPV relay needs both.
 
 Manual run:
 
@@ -62,6 +67,62 @@ Test connection:
 
 ```bash
 ping 192.168.144.25
+```
+
+## FPV Relay
+
+When `Auto FPV relay` is enabled, `Connect + Play` starts MediaMTX if needed and publishes the FPV camera to:
+
+```text
+rtsp://127.0.0.1:8554/cam2
+```
+
+The default source is:
+
+```text
+rtsp://192.168.144.26:554/
+```
+
+You can change the source/output in the Connection panel. For fixed deployments, these environment variables are also supported:
+
+```bash
+MT11_FPV_SOURCE_URL=rtsp://192.168.144.26:554/
+MT11_FPV_RELAY_URL=rtsp://127.0.0.1:8554/cam2
+MT11_FPV_RELAY_ENABLED=1
+MT11_FPV_MAX_DELAY_US=250000
+MT11_FPV_RELAY_FALLBACK_PORT=8555
+MT11_FFMPEG_BIN=/usr/bin/ffmpeg
+MT11_MEDIAMTX_BIN=/usr/local/bin/mediamtx
+```
+
+If another MediaMTX is already using `8554`, MT11Control probes whether the configured output path accepts publishers. If it does not, the app automatically starts its own TCP-only MediaMTX on the fallback port and updates the FPV output URL.
+
+## Local Stream Simulator
+
+MT11Control has a hidden local simulator for development without cameras. It only appears when this machine has:
+
+```text
+~/.mt11control_simulator
+```
+
+or when launched with:
+
+```bash
+MT11_SIMULATOR_AVAILABLE=1 ./run_mt11control.sh
+```
+
+When enabled in the Connection panel, `Connect + Play` loops `~/Videos/sample.mp4` into local RTSP streams through MediaMTX:
+
+```text
+rtsp://127.0.0.1:8554/mt11sim1
+rtsp://127.0.0.1:8554/mt11sim2
+rtsp://127.0.0.1:8554/cam2
+```
+
+The simulator video path can be changed with:
+
+```bash
+MT11_SIM_SAMPLE_VIDEO=/path/to/sample.mp4 ./run_mt11control.sh
 ```
 
 ## Basic SDK Usage

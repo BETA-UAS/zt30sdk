@@ -7,15 +7,17 @@ import math
 import os
 import select
 import shutil
+import socket
 import struct
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import webbrowser
 from pathlib import Path
-from typing import Callable, Optional
-from urllib.parse import urlparse
+from typing import Callable, Dict, Optional
+from urllib.parse import urlparse, urlunparse
 from urllib.request import urlopen
 
 from PyQt5.QtCore import QLibraryInfo, QPoint, QPointF, QRect, QSize, QThread, QTimer, Qt, pyqtSignal
@@ -67,6 +69,19 @@ VIDEO_RENDER_INTERVAL_MS = max(1, round(1000 / MAIN_STREAM_FPS))
 PIP_SIZE_DEFAULT = (320, 180)
 AI_COORD_SIZE = (1280, 720)
 THERMAL_COORD_SIZE = (640, 512)
+DEFAULT_FPV_SOURCE_URL = os.environ.get("MT11_FPV_SOURCE_URL", "rtsp://192.168.144.26:554/")
+DEFAULT_FPV_RELAY_URL = os.environ.get("MT11_FPV_RELAY_URL", "rtsp://127.0.0.1:8554/cam2")
+FPV_RELAY_FALLBACK_PORT = int(os.environ.get("MT11_FPV_RELAY_FALLBACK_PORT", "8555"))
+FPV_RELAY_ENABLED_DEFAULT = os.environ.get("MT11_FPV_RELAY_ENABLED", "1").strip().lower() not in ("0", "false", "no", "off")
+FPV_RELAY_MAX_DELAY_US = int(os.environ.get("MT11_FPV_MAX_DELAY_US", "250000"))
+FPV_RELAY_BUFFER_SIZE = int(os.environ.get("MT11_FPV_BUFFER_SIZE", "1048576"))
+FPV_RELAY_REORDER_QUEUE = int(os.environ.get("MT11_FPV_REORDER_QUEUE", "256"))
+SIMULATOR_MARKER = Path(os.environ.get("MT11_SIMULATOR_MARKER", Path.home() / ".mt11control_simulator"))
+SIMULATOR_AVAILABLE = os.environ.get("MT11_SIMULATOR_AVAILABLE", "0").strip().lower() in ("1", "true", "yes", "on") or SIMULATOR_MARKER.exists()
+SIM_RTSP_BASE = os.environ.get("MT11_SIM_RTSP_BASE", "rtsp://127.0.0.1:8554")
+SIM_VIDEO1_URL = os.environ.get("MT11_SIM_VIDEO1_URL", f"{SIM_RTSP_BASE}/mt11sim1")
+SIM_VIDEO2_URL = os.environ.get("MT11_SIM_VIDEO2_URL", f"{SIM_RTSP_BASE}/mt11sim2")
+SIM_SAMPLE_VIDEO = Path(os.environ.get("MT11_SIM_SAMPLE_VIDEO", Path.home() / "Videos" / "sample.mp4")).expanduser()
 
 CAMERA_VIEWS = {
     "Zoom + Thermal": "zoom_sub_thermal",
@@ -295,6 +310,527 @@ class FFmpegStreamThread(QThread):
                 pass
 
         self._process = None
+
+
+class FPVRelayManager:
+    def __init__(
+        self,
+        parent,
+        source_url_getter: Callable[[], str],
+        output_url_getter: Callable[[], str],
+        output_url_setter: Callable[[str], None],
+        log_callback: Callable[[str], None],
+    ):
+        self.parent = parent
+        self.source_url_getter = source_url_getter
+        self.output_url_getter = output_url_getter
+        self.output_url_setter = output_url_setter
+        self.log = log_callback
+        self.mediamtx_process: Optional[subprocess.Popen] = None
+        self.mediamtx_config_path: Optional[Path] = None
+        self.ffmpeg_process: Optional[subprocess.Popen] = None
+        self.running = False
+        self.ffmpeg_restart_attempts = 0
+        self.mediamtx_owned = False
+
+        self.monitor_timer = QTimer(parent)
+        self.monitor_timer.timeout.connect(self._monitor)
+        self.restart_timer = QTimer(parent)
+        self.restart_timer.setSingleShot(True)
+        self.restart_timer.timeout.connect(self._start_ffmpeg)
+
+    def start(self) -> bool:
+        ffmpeg_bin = self._ffmpeg_bin()
+        if not ffmpeg_bin:
+            self.log("FPV relay: ffmpeg not found")
+            return False
+
+        self.running = True
+        self.ffmpeg_restart_attempts = 0
+
+        if not self._ensure_mediamtx():
+            self.running = False
+            return False
+
+        self._start_ffmpeg()
+        if not self.monitor_timer.isActive():
+            self.monitor_timer.start(1000)
+        return True
+
+    def stop(self) -> None:
+        self.running = False
+        self.restart_timer.stop()
+        self.monitor_timer.stop()
+        self._stop_process("ffmpeg_process")
+
+        if self.mediamtx_owned:
+            self._stop_process("mediamtx_process")
+            self.mediamtx_owned = False
+            self._remove_mediamtx_config()
+
+    def _ensure_mediamtx(self) -> bool:
+        output_url = self.output_url_getter().strip()
+        host, port = self._rtsp_host_port(output_url)
+        if self._tcp_listening(host, port):
+            if self._publisher_probe(output_url):
+                self.log(f"FPV relay: using existing RTSP server on {host}:{port}")
+                return True
+
+            rejected_url = output_url
+            fallback_url = self._fallback_output_url(output_url)
+            if not fallback_url:
+                self.log(f"FPV relay: existing RTSP server on {host}:{port} rejected publishers")
+                return False
+
+            self.output_url_setter(fallback_url)
+            output_url = fallback_url
+            host, port = self._rtsp_host_port(output_url)
+            self.log(f"FPV relay: existing RTSP server rejected {rejected_url}, using {output_url}")
+
+            if self._tcp_listening(host, port):
+                if self._publisher_probe(output_url):
+                    self.log(f"FPV relay: using fallback RTSP server on {host}:{port}")
+                    return True
+                self.log(f"FPV relay: fallback RTSP server on {host}:{port} rejected publishers")
+                return False
+
+        mediamtx_bin = os.environ.get("MT11_MEDIAMTX_BIN") or shutil.which("mediamtx")
+        if not mediamtx_bin:
+            self.log("FPV relay: mediamtx not found")
+            return False
+
+        try:
+            self.mediamtx_config_path = self._write_mediamtx_config(port)
+            self.mediamtx_process = subprocess.Popen(
+                [mediamtx_bin, str(self.mediamtx_config_path)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            self.mediamtx_owned = True
+        except Exception as exc:
+            self.log(f"FPV relay: failed to start mediamtx: {exc}")
+            return False
+
+        deadline = time.monotonic() + 4.0
+        while time.monotonic() < deadline:
+            if self.mediamtx_process.poll() is not None:
+                self.log("FPV relay: mediamtx exited during startup")
+                return False
+            if self._tcp_listening(host, port):
+                self.log(f"FPV relay: mediamtx ready on {host}:{port}")
+                return True
+            time.sleep(0.1)
+
+        self.log(f"FPV relay: mediamtx did not open {host}:{port}")
+        return False
+
+    def _write_mediamtx_config(self, rtsp_port: int) -> Path:
+        fd, path = tempfile.mkstemp(prefix="mt11control-mediamtx-", suffix=".yml")
+        config_path = Path(path)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(f"rtspAddress: :{rtsp_port}\n")
+            handle.write("rtspTransports: [tcp]\n")
+            handle.write("rtmp: no\n")
+            handle.write("hls: no\n")
+            handle.write("webrtc: no\n")
+            handle.write("srt: no\n")
+            handle.write("moq: no\n")
+            handle.write("paths:\n")
+            handle.write("  all_others:\n")
+            handle.write("    source: publisher\n")
+        return config_path
+
+    def _remove_mediamtx_config(self) -> None:
+        if not self.mediamtx_config_path:
+            return
+        try:
+            self.mediamtx_config_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        self.mediamtx_config_path = None
+
+    def _start_ffmpeg(self) -> None:
+        if not self.running:
+            return
+
+        self._stop_process("ffmpeg_process")
+        source_url = self.source_url_getter().strip()
+        output_url = self.output_url_getter().strip()
+        if not source_url:
+            self.log("FPV relay: source URL is empty")
+            return
+
+        cmd = [
+            self._ffmpeg_bin() or "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "warning",
+            "-rtsp_transport",
+            "udp",
+            "-flags",
+            "low_delay",
+            "-fflags",
+            "+discardcorrupt",
+            "-buffer_size",
+            str(FPV_RELAY_BUFFER_SIZE),
+            "-reorder_queue_size",
+            str(FPV_RELAY_REORDER_QUEUE),
+            "-max_delay",
+            str(FPV_RELAY_MAX_DELAY_US),
+            "-analyzeduration",
+            "500000",
+            "-probesize",
+            "500000",
+            "-i",
+            source_url,
+            "-map",
+            "0:v:0",
+            "-an",
+            "-c:v",
+            "copy",
+            "-f",
+            "rtsp",
+            "-rtsp_transport",
+            "tcp",
+            "-muxdelay",
+            "0",
+            "-muxpreload",
+            "0",
+            output_url,
+        ]
+
+        try:
+            self.ffmpeg_process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            self.log(f"FPV relay: publishing {source_url} -> {output_url}")
+        except Exception as exc:
+            self.log(f"FPV relay: failed to start ffmpeg: {exc}")
+            self._schedule_ffmpeg_restart()
+
+    def _monitor(self) -> None:
+        if not self.running:
+            return
+
+        if self.mediamtx_owned and self.mediamtx_process and self.mediamtx_process.poll() is not None:
+            self.log("FPV relay: mediamtx stopped, restarting")
+            self.mediamtx_process = None
+            if not self._ensure_mediamtx():
+                return
+            self._schedule_ffmpeg_restart()
+            return
+
+        if self.ffmpeg_process is None:
+            self._schedule_ffmpeg_restart()
+            return
+
+        if self.ffmpeg_process.poll() is not None:
+            self.log("FPV relay: ffmpeg stopped")
+            self.ffmpeg_process = None
+            self._schedule_ffmpeg_restart()
+
+    def _schedule_ffmpeg_restart(self) -> None:
+        if not self.running or self.restart_timer.isActive():
+            return
+
+        self.ffmpeg_restart_attempts += 1
+        delay_ms = min(10000, 500 * (2 ** min(self.ffmpeg_restart_attempts, 5)))
+        self.log(f"FPV relay: reconnecting in {delay_ms / 1000:.1f}s")
+        self.restart_timer.start(delay_ms)
+
+    def _stop_process(self, attr: str) -> None:
+        process = getattr(self, attr)
+        if process is None:
+            return
+
+        try:
+            process.terminate()
+            process.wait(timeout=1.5)
+        except Exception:
+            try:
+                process.kill()
+            except Exception:
+                pass
+        setattr(self, attr, None)
+
+    @staticmethod
+    def _rtsp_host_port(url: str) -> tuple[str, int]:
+        parsed = urlparse(url)
+        return parsed.hostname or "127.0.0.1", parsed.port or 554
+
+    @staticmethod
+    def _fallback_output_url(url: str) -> Optional[str]:
+        parsed = urlparse(url)
+        host = parsed.hostname or "127.0.0.1"
+        if host not in ("127.0.0.1", "localhost", "0.0.0.0", "::1"):
+            return None
+
+        netloc = f"{host}:{FPV_RELAY_FALLBACK_PORT}"
+        return urlunparse((parsed.scheme or "rtsp", netloc, parsed.path or "/cam2", "", "", ""))
+
+    @staticmethod
+    def _ffmpeg_bin() -> Optional[str]:
+        return os.environ.get("MT11_FFMPEG_BIN") or shutil.which("ffmpeg")
+
+    @classmethod
+    def _publisher_probe(cls, url: str) -> bool:
+        ffmpeg_bin = cls._ffmpeg_bin()
+        if not ffmpeg_bin:
+            return False
+
+        cmd = [
+            ffmpeg_bin,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=size=16x16:rate=1:duration=0.2",
+            "-an",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-tune",
+            "zerolatency",
+            "-f",
+            "rtsp",
+            "-rtsp_transport",
+            "tcp",
+            url,
+        ]
+        try:
+            result = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5.0)
+            return result.returncode == 0
+        except Exception:
+            return False
+
+    @staticmethod
+    def _tcp_listening(host: str, port: int) -> bool:
+        try:
+            with socket.create_connection((host, port), timeout=0.25):
+                return True
+        except OSError:
+            return False
+
+
+class RTSPStreamSimulator:
+    def __init__(self, parent, log_callback: Callable[[str], None], fpv_output_getter: Callable[[], str]):
+        self.parent = parent
+        self.log = log_callback
+        self.fpv_output_getter = fpv_output_getter
+        self.running = False
+        self.mediamtx_process: Optional[subprocess.Popen] = None
+        self.mediamtx_config_path: Optional[Path] = None
+        self.mediamtx_owned = False
+        self.processes: Dict[str, subprocess.Popen] = {}
+        self.restart_attempts: Dict[str, int] = {}
+
+        self.monitor_timer = QTimer(parent)
+        self.monitor_timer.timeout.connect(self._monitor)
+        self.restart_timer = QTimer(parent)
+        self.restart_timer.setSingleShot(True)
+        self.restart_timer.timeout.connect(self._restart_missing)
+
+    def start(self) -> bool:
+        ffmpeg_bin = FPVRelayManager._ffmpeg_bin()
+        if not ffmpeg_bin:
+            self.log("Simulator: ffmpeg not found")
+            return False
+        if not SIM_SAMPLE_VIDEO.exists():
+            self.log(f"Simulator: sample video not found: {SIM_SAMPLE_VIDEO}")
+            return False
+
+        self.running = True
+        if not self._ensure_mediamtx():
+            self.running = False
+            return False
+
+        for name, url in self._streams():
+            self._start_stream(name, url)
+
+        if not self.monitor_timer.isActive():
+            self.monitor_timer.start(1000)
+        self.log("Simulator: RTSP streams ready")
+        return True
+
+    def stop(self) -> None:
+        self.running = False
+        self.restart_timer.stop()
+        self.monitor_timer.stop()
+
+        for name in list(self.processes):
+            self._stop_stream(name)
+
+        if self.mediamtx_owned:
+            self._stop_process(self.mediamtx_process)
+            self.mediamtx_process = None
+            self.mediamtx_owned = False
+            self._remove_mediamtx_config()
+
+    def _streams(self):
+        return (
+            ("sim-video1", SIM_VIDEO1_URL),
+            ("sim-video2", SIM_VIDEO2_URL),
+            ("sim-fpv", self.fpv_output_getter().strip() or DEFAULT_FPV_RELAY_URL),
+        )
+
+    def _ensure_mediamtx(self) -> bool:
+        host, port = FPVRelayManager._rtsp_host_port(SIM_VIDEO1_URL)
+        if FPVRelayManager._tcp_listening(host, port):
+            self.log(f"Simulator: using existing RTSP server on {host}:{port}")
+            return True
+
+        mediamtx_bin = os.environ.get("MT11_MEDIAMTX_BIN") or shutil.which("mediamtx")
+        if not mediamtx_bin:
+            self.log("Simulator: mediamtx not found")
+            return False
+
+        try:
+            self.mediamtx_config_path = self._write_mediamtx_config()
+            self.mediamtx_process = subprocess.Popen(
+                [mediamtx_bin, str(self.mediamtx_config_path)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            self.mediamtx_owned = True
+        except Exception as exc:
+            self.log(f"Simulator: failed to start mediamtx: {exc}")
+            return False
+
+        deadline = time.monotonic() + 4.0
+        while time.monotonic() < deadline:
+            if self.mediamtx_process.poll() is not None:
+                self.log("Simulator: mediamtx exited during startup")
+                return False
+            if FPVRelayManager._tcp_listening(host, port):
+                self.log(f"Simulator: mediamtx ready on {host}:{port}")
+                return True
+            time.sleep(0.1)
+
+        self.log(f"Simulator: mediamtx did not open {host}:{port}")
+        return False
+
+    def _write_mediamtx_config(self) -> Path:
+        fd, path = tempfile.mkstemp(prefix="mt11control-sim-mediamtx-", suffix=".yml")
+        config_path = Path(path)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write("rtspTransports: [tcp]\n")
+            handle.write("rtmp: no\n")
+            handle.write("hls: no\n")
+            handle.write("webrtc: no\n")
+            handle.write("srt: no\n")
+            handle.write("moq: no\n")
+            handle.write("paths:\n")
+            handle.write("  all_others:\n")
+            handle.write("    source: publisher\n")
+        return config_path
+
+    def _remove_mediamtx_config(self) -> None:
+        if not self.mediamtx_config_path:
+            return
+        try:
+            self.mediamtx_config_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        self.mediamtx_config_path = None
+
+    def _start_stream(self, name: str, url: str) -> None:
+        self._stop_stream(name)
+        cmd = [
+            FPVRelayManager._ffmpeg_bin() or "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "warning",
+            "-re",
+            "-stream_loop",
+            "-1",
+            "-i",
+            str(SIM_SAMPLE_VIDEO),
+            "-an",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-tune",
+            "zerolatency",
+            "-pix_fmt",
+            "yuv420p",
+            "-g",
+            "24",
+            "-bf",
+            "0",
+            "-f",
+            "rtsp",
+            "-rtsp_transport",
+            "tcp",
+            url,
+        ]
+
+        try:
+            self.processes[name] = subprocess.Popen(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            self.log(f"Simulator: publishing {name} -> {url}")
+        except Exception as exc:
+            self.log(f"Simulator: failed to start {name}: {exc}")
+            self._schedule_restart()
+
+    def _monitor(self) -> None:
+        if not self.running:
+            return
+
+        if self.mediamtx_owned and self.mediamtx_process and self.mediamtx_process.poll() is not None:
+            self.log("Simulator: mediamtx stopped, restarting")
+            self.mediamtx_process = None
+            if not self._ensure_mediamtx():
+                return
+            self._schedule_restart()
+            return
+
+        for name, process in list(self.processes.items()):
+            if process.poll() is not None:
+                self.log(f"Simulator: {name} stopped")
+                self.processes.pop(name, None)
+                self.restart_attempts[name] = self.restart_attempts.get(name, 0) + 1
+                self._schedule_restart()
+
+    def _schedule_restart(self) -> None:
+        if not self.running or self.restart_timer.isActive():
+            return
+        delay_ms = min(5000, 500 * (2 ** min(max(self.restart_attempts.values() or [0]), 4)))
+        self.log(f"Simulator: restarting missing streams in {delay_ms / 1000:.1f}s")
+        self.restart_timer.start(delay_ms)
+
+    def _restart_missing(self) -> None:
+        if not self.running:
+            return
+        running_names = set(self.processes)
+        for name, url in self._streams():
+            if name not in running_names:
+                self._start_stream(name, url)
+
+    def _stop_stream(self, name: str) -> None:
+        process = self.processes.pop(name, None)
+        self._stop_process(process)
+
+    @staticmethod
+    def _stop_process(process: Optional[subprocess.Popen]) -> None:
+        if process is None:
+            return
+        try:
+            process.terminate()
+            process.wait(timeout=1.5)
+        except Exception:
+            try:
+                process.kill()
+            except Exception:
+                pass
 
 
 class JoystickThread(QThread):
@@ -796,6 +1332,8 @@ class MT11QtDashboard(QMainWindow):
         self.client: Optional[MT11UDPClient] = None
         self.ai_client: Optional[MT11AITrackingClient] = None
         self.web_client: Optional[MT11WebClient] = None
+        self.fpv_relay: Optional[FPVRelayManager] = None
+        self.stream_simulator: Optional[RTSPStreamSimulator] = None
         self.connected_host = ""
         self.connected_port = 0
         self.connected_ai_host = ""
@@ -831,6 +1369,18 @@ class MT11QtDashboard(QMainWindow):
 
         self._build_ui()
         self._apply_style()
+        self.fpv_relay = FPVRelayManager(
+            self,
+            lambda: self.fpv_source_edit.text(),
+            lambda: self.fpv_relay_url_edit.text(),
+            self.fpv_relay_url_edit.setText,
+            self.log_message,
+        )
+        self.stream_simulator = RTSPStreamSimulator(
+            self,
+            self.log_message,
+            lambda: self.fpv_relay_url_edit.text(),
+        )
 
         self.log_signal.connect(self.log.append)
         self.telemetry_signal.connect(self._apply_telemetry)
@@ -885,7 +1435,7 @@ class MT11QtDashboard(QMainWindow):
 
         tools.addWidget(QLabel("Main"))
         self.main_source_combo = QComboBox()
-        self.main_source_combo.addItems(["Video 1", "Video 2"])
+        self.main_source_combo.addItems(["Video 1", "Video 2", "FPV Camera"])
         self.main_source_combo.setCurrentText("Video 1")
         self.main_source_combo.currentIndexChanged.connect(self.handle_source_change)
         tools.addWidget(self.main_source_combo)
@@ -1020,6 +1570,20 @@ class MT11QtDashboard(QMainWindow):
         connect_play = QPushButton("Connect + Play")
         connect_play.clicked.connect(self.start_streams)
 
+        self.fpv_relay_check = QCheckBox("Auto FPV relay")
+        self.fpv_relay_check.setChecked(FPV_RELAY_ENABLED_DEFAULT)
+
+        self.fpv_source_edit = QLineEdit(DEFAULT_FPV_SOURCE_URL)
+        self.fpv_source_edit.setMinimumWidth(180)
+
+        self.fpv_relay_url_edit = QLineEdit(DEFAULT_FPV_RELAY_URL)
+        self.fpv_relay_url_edit.setMinimumWidth(180)
+
+        self.simulator_check = QCheckBox("Use local stream simulator")
+        self.simulator_check.setChecked(False)
+        self.simulator_check.setVisible(SIMULATOR_AVAILABLE)
+        self.simulator_check.setToolTip(f"Enabled on this machine by {SIMULATOR_MARKER}")
+
         grid.addWidget(QLabel("Camera IP"), 0, 0)
         grid.addWidget(self.host_edit, 0, 1, 1, 2)
 
@@ -1027,7 +1591,15 @@ class MT11QtDashboard(QMainWindow):
         grid.addWidget(self.port_spin, 1, 1)
         grid.addWidget(reconnect, 1, 2)
 
-        grid.addWidget(connect_play, 2, 1, 1, 2)
+        grid.addWidget(self.fpv_relay_check, 2, 0, 1, 3)
+        grid.addWidget(QLabel("FPV Source"), 3, 0)
+        grid.addWidget(self.fpv_source_edit, 3, 1, 1, 2)
+        grid.addWidget(QLabel("FPV Output"), 4, 0)
+        grid.addWidget(self.fpv_relay_url_edit, 4, 1, 1, 2)
+
+        grid.addWidget(self.simulator_check, 5, 0, 1, 3)
+
+        grid.addWidget(connect_play, 6, 1, 1, 2)
 
         box.layout().addLayout(grid)
         return box
@@ -1519,6 +2091,12 @@ class MT11QtDashboard(QMainWindow):
         self.stream_restart_pending = {"primary": False, "video2": False}
         self.stream_reconnect_attempts = {"primary": 0, "video2": 0}
 
+        if self._simulator_enabled():
+            if self.stream_simulator:
+                self.stream_simulator.start()
+        elif self.fpv_relay and (self.fpv_relay_check.isChecked() or primary_source["name"] == "FPV Camera"):
+            self.fpv_relay.start()
+
         self.main_thread = self._start_stream(
             primary_source["url"],
             *STREAM_SIZE,
@@ -1543,14 +2121,25 @@ class MT11QtDashboard(QMainWindow):
     def _source_spec(self, name: str):
         name = name.strip()
         camera_host = self.host_edit.text().strip()
+        simulator = self._simulator_enabled()
 
         if name == "Video 1":
+            if simulator:
+                return {"name": name, "url": SIM_VIDEO1_URL, "transport": "tcp"}
             return {"name": name, "url": rtsp_url(camera_host, 1), "transport": "tcp"}
 
         if name == "Video 2":
+            if simulator:
+                return {"name": name, "url": SIM_VIDEO2_URL, "transport": "tcp"}
             return {"name": name, "url": rtsp_url(camera_host, 2), "transport": "tcp"}
 
+        if name == "FPV Camera":
+            return {"name": name, "url": self.fpv_relay_url_edit.text().strip(), "transport": "tcp"}
+
         raise ValueError(f"unknown source {name!r}")
+
+    def _simulator_enabled(self) -> bool:
+        return SIMULATOR_AVAILABLE and hasattr(self, "simulator_check") and self.simulator_check.isChecked()
 
     def _start_stream(self, url: str, width: int, height: int, frame_slot, transport: str = "tcp", name: str = "stream", fps: int = MAIN_STREAM_FPS):
         thread = FFmpegStreamThread(url, width, height, transport=transport, name=name, fps=fps, parent=self)
@@ -1613,6 +2202,12 @@ class MT11QtDashboard(QMainWindow):
 
         if self.ai_client:
             self._set_ai_rtsp_enabled(False)
+
+        if self.fpv_relay:
+            self.fpv_relay.stop()
+
+        if self.stream_simulator:
+            self.stream_simulator.stop()
 
     def _handle_stream_stalled(self, name: str):
         if name not in ("primary", "video2") or not self.streams_requested:
