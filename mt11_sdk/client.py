@@ -148,6 +148,12 @@ class MT11UDPClient:
             return None
         return {0: "lock", 1: "follow", 2: "fpv"}.get(pkt.payload[0], f"unknown_{pkt.payload[0]}")
 
+    def request_working_mode_raw(self) -> Optional[int]:
+        pkt = self.send(0x19)
+        if not pkt or len(pkt.payload) < 1:
+            return None
+        return pkt.payload[0]
+
     def request_config(self) -> Optional[Dict[str, Any]]:
         pkt = self.send(0x0A)
         if not pkt:
@@ -347,24 +353,41 @@ class MT11UDPClient:
         self.camera_function(f"{mode}_mode", wait_response=False)
 
         working_mode = None
+        working_raw = None
         config_mode = None
-        for _ in range(4):
+        config_raw = None
+        config = {}
+        deadline = time.monotonic() + 2.5
+        while time.monotonic() < deadline:
             time.sleep(0.25)
+            working_raw = self.request_working_mode_raw()
+            working_mode = {0: "lock", 1: "follow", 2: "fpv"}.get(working_raw, f"unknown_{working_raw}") if working_raw is not None else None
+            config = self.request_config() or {}
+            config_mode = config.get("motion_mode")
+            raw_payload = config.get("raw")
+            config_raw = raw_payload[4] if raw_payload and len(raw_payload) >= 5 else None
+            if working_mode == mode and config_mode == mode:
+                break
+
+        if working_mode != mode:
+            # One final read helps when CMD 0x0C settles just after the loop.
             working_mode = self.request_working_mode()
             config = self.request_config() or {}
             config_mode = config.get("motion_mode")
-            if working_mode == mode or config_mode == mode:
-                break
+            raw_payload = config.get("raw")
+            config_raw = raw_payload[4] if raw_payload and len(raw_payload) >= 5 else config_raw
 
         actual = working_mode or config_mode
-        if working_mode != mode and config_mode != mode and actual is not None:
+        if working_mode != mode and config_mode != mode:
             raise RuntimeError(f"requested {mode}, camera reports {actual}")
 
         return {
             "requested": mode,
             "working_mode": working_mode,
             "config_mode": config_mode,
-            "verified": (working_mode == mode or config_mode == mode) if actual is not None else None,
+            "working_raw": working_raw,
+            "config_raw": config_raw,
+            "verified": working_mode == mode or config_mode == mode,
         }
 
     # Codec and image mode
