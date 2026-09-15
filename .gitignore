@@ -22,5 +22,6 @@ appimagetool-*.AppImage
 run_dashboard.sh
 
 build-appimage/
+video_core/build/
 
 .DS_Store

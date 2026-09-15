@@ -28,6 +28,7 @@ FPV relay out : rtsp://127.0.0.1:8554/cam2
 - MT11 media web API browsing and downloads
 - PyQt5 live RTSP dashboard with joystick support
 - Optional FPV RTSP relay through MediaMTX for QGroundControl/client reuse
+- Hybrid C++ video core for lower-risk FPV relay and stream recording supervision
 
 ## Setup
 
@@ -37,6 +38,7 @@ FPV relay out : rtsp://127.0.0.1:8554/cam2
 ```
 
 `setup.sh` checks for `ffmpeg` and `mediamtx`. The FPV relay needs both.
+It also builds the optional C++ video core when `cmake` and `g++` are available.
 
 Manual run:
 
@@ -96,11 +98,36 @@ MT11_FPV_MAX_DELAY_US=250000
 MT11_FPV_RELAY_FALLBACK_PORT=8555
 MT11_FFMPEG_BIN=/usr/bin/ffmpeg
 MT11_MEDIAMTX_BIN=/usr/local/bin/mediamtx
+MT11_VIDEO_CORE_ENABLED=1
+MT11_VIDEO_CORE_BIN=/path/to/mt11_video_core
 ```
 
 If another MediaMTX is already using `8554`, MT11Control probes whether the configured output path accepts publishers. If it does not, the app automatically starts its own TCP-only MediaMTX on the fallback port and updates the FPV output URL.
 
 `QGC Safe` mode decodes and re-encodes the FPV feed as low-latency H.264 Baseline with fixed FPS/keyframes. Use `Raw Low Latency` only when you need the lowest possible delay and QGroundControl is stable with the source bitstream.
+
+## C++ Video Core
+
+`video_core/` contains the transitional C++ process supervisor used by the PyQt dashboard when available. It owns the heavier FPV relay and local stream-recording process lifecycle, while the Python UI continues to handle cockpit controls, telemetry, AI commands, and current display rendering.
+
+Build manually:
+
+```bash
+cmake -S video_core -B video_core/build
+cmake --build video_core/build --parallel
+```
+
+Disable the hybrid core and fall back to the Python-managed path:
+
+```bash
+MT11_VIDEO_CORE_ENABLED=0 ./run_mt11control.sh
+```
+
+For low-spec field computers, stream load can be tuned without editing source:
+
+```bash
+MT11_MAIN_STREAM_FPS=20 MT11_MAIN_STREAM_WIDTH=854 MT11_MAIN_STREAM_HEIGHT=480 ./run_mt11control.sh
+```
 
 ## Local Stream Simulator
 

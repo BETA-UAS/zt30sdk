@@ -8,6 +8,7 @@ APPDIR="${BUILD_DIR}/MT11Control.AppDir"
 APP_NAME="MT11Control"
 APP_ID="mt11-control"
 APPIMAGE_OUT="${ROOT_DIR}/MT11Control.AppImage"
+BUILD_VIDEO_CORE="${BUILD_VIDEO_CORE:-1}"
 
 echo "[appimage] Building ${APP_NAME}"
 
@@ -22,8 +23,41 @@ if ! command -v ffmpeg >/dev/null 2>&1; then
   echo "            but RTSP playback needs ffmpeg available at runtime."
 fi
 
+appimage_arch() {
+  case "$(uname -m)" in
+    x86_64|amd64)
+      echo "x86_64"
+      ;;
+    aarch64|arm64)
+      echo "aarch64"
+      ;;
+    *)
+      echo "unsupported"
+      ;;
+  esac
+}
+
+build_video_core() {
+  if [[ "${BUILD_VIDEO_CORE}" != "1" ]]; then
+    echo "[appimage] Skipping C++ video core build because BUILD_VIDEO_CORE=${BUILD_VIDEO_CORE}"
+    return
+  fi
+
+  if ! command -v cmake >/dev/null 2>&1 || ! command -v g++ >/dev/null 2>&1; then
+    echo "[appimage] WARNING: cmake and g++ are required to bundle mt11_video_core."
+    echo "           AppImage will run with Python fallback unless mt11_video_core is provided."
+    return
+  fi
+
+  echo "[appimage] Building C++ video core"
+  cmake -S "${ROOT_DIR}/video_core" -B "${ROOT_DIR}/video_core/build"
+  cmake --build "${ROOT_DIR}/video_core/build" --parallel
+}
+
 rm -rf "${BUILD_DIR}"
 mkdir -p "${BUILD_DIR}"
+
+build_video_core
 
 python3 -m venv "${VENV_DIR}"
 "${VENV_DIR}/bin/python" -m pip install --upgrade pip setuptools wheel
@@ -53,6 +87,12 @@ if command -v mediamtx >/dev/null 2>&1; then
   cp "$(command -v mediamtx)" "${APPDIR}/usr/bin/mediamtx" || true
 fi
 
+if [[ -x "${ROOT_DIR}/video_core/build/mt11_video_core" ]]; then
+  cp "${ROOT_DIR}/video_core/build/mt11_video_core" "${APPDIR}/usr/bin/mt11_video_core"
+else
+  echo "[appimage] WARNING: mt11_video_core was not bundled."
+fi
+
 cat > "${APPDIR}/AppRun" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -61,6 +101,12 @@ unset PYTHONHOME
 unset PYTHONPATH
 export PYTHONNOUSERSITE=1
 export PATH="${HERE}/usr/bin:${PATH}"
+if [[ -x "${HERE}/usr/bin/mt11_video_core" ]]; then
+  export MT11_VIDEO_CORE_BIN="${HERE}/usr/bin/mt11_video_core"
+fi
+if [[ -x "${HERE}/usr/bin/mediamtx" ]]; then
+  export MT11_MEDIAMTX_BIN="${HERE}/usr/bin/mediamtx"
+fi
 export QT_QPA_PLATFORM_PLUGIN_PATH="${HERE}/usr/bin/MT11Control/_internal/PyQt5/Qt5/plugins:${QT_QPA_PLATFORM_PLUGIN_PATH:-}"
 exec "${HERE}/usr/bin/MT11Control/MT11Control" "$@"
 EOF
@@ -94,19 +140,25 @@ for target in [
     img.save(target)
 PY
 
-APPIMAGETOOL="${BUILD_DIR}/appimagetool-x86_64.AppImage"
+ARCH_NAME="$(appimage_arch)"
+if [[ "${ARCH_NAME}" == "unsupported" ]]; then
+  echo "[appimage] ERROR: unsupported AppImage architecture: $(uname -m)"
+  exit 1
+fi
+
+APPIMAGETOOL="${BUILD_DIR}/appimagetool-${ARCH_NAME}.AppImage"
 if command -v appimagetool >/dev/null 2>&1; then
   APPIMAGETOOL="$(command -v appimagetool)"
 else
   echo "[appimage] Downloading appimagetool"
   curl -L --fail \
     -o "${APPIMAGETOOL}" \
-    "https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage"
+    "https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-${ARCH_NAME}.AppImage"
   chmod +x "${APPIMAGETOOL}"
 fi
 
 echo "[appimage] Packaging AppImage"
-ARCH=x86_64 "${APPIMAGETOOL}" "${APPDIR}" "${APPIMAGE_OUT}"
+ARCH="${ARCH_NAME}" "${APPIMAGETOOL}" "${APPDIR}" "${APPIMAGE_OUT}"
 chmod +x "${APPIMAGE_OUT}"
 
 echo

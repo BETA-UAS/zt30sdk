@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import math
+import json
 import os
 import select
 import shutil
@@ -62,10 +63,16 @@ from mt11_sdk import AITrackingBox, DEFAULT_AI_IP, DEFAULT_IP, DEFAULT_PORT, MT1
 from mt11_sdk.constants import IMAGE_MODE_BY_NAME, IMAGE_MODES, THERMAL_PALETTES
 
 
-STREAM_SIZE = (960, 540)
-PIP_STREAM_SIZE = (480, 270)
-MAIN_STREAM_FPS = 24
-PIP_STREAM_FPS = 8
+STREAM_SIZE = (
+    int(os.environ.get("MT11_MAIN_STREAM_WIDTH", "960")),
+    int(os.environ.get("MT11_MAIN_STREAM_HEIGHT", "540")),
+)
+PIP_STREAM_SIZE = (
+    int(os.environ.get("MT11_PIP_STREAM_WIDTH", "480")),
+    int(os.environ.get("MT11_PIP_STREAM_HEIGHT", "270")),
+)
+MAIN_STREAM_FPS = int(os.environ.get("MT11_MAIN_STREAM_FPS", "24"))
+PIP_STREAM_FPS = int(os.environ.get("MT11_PIP_STREAM_FPS", "8"))
 VIDEO_RENDER_INTERVAL_MS = max(1, round(1000 / MAIN_STREAM_FPS))
 PIP_SIZE_DEFAULT = (320, 180)
 AI_COORD_SIZE = (1280, 720)
@@ -82,6 +89,8 @@ FPV_RELAY_SAFE_BUFSIZE = os.environ.get("MT11_FPV_SAFE_BUFSIZE", "1000k")
 FPV_RELAY_MAX_DELAY_US = int(os.environ.get("MT11_FPV_MAX_DELAY_US", "250000"))
 FPV_RELAY_BUFFER_SIZE = int(os.environ.get("MT11_FPV_BUFFER_SIZE", "1048576"))
 FPV_RELAY_REORDER_QUEUE = int(os.environ.get("MT11_FPV_REORDER_QUEUE", "256"))
+FPV_RELAY_RESTART_MAX_MS = int(os.environ.get("MT11_FPV_RESTART_MAX_MS", "60000"))
+FPV_RELAY_SOURCE_RETRY_MS = int(os.environ.get("MT11_FPV_SOURCE_RETRY_MS", "15000"))
 STATUS_REFRESH_MS = int(os.environ.get("MT11_STATUS_REFRESH_MS", "1000"))
 LASER_RANGE_REFRESH_MS = int(os.environ.get("MT11_LASER_RANGE_REFRESH_MS", "1000"))
 LASER_TARGET_REFRESH_MS = int(os.environ.get("MT11_LASER_TARGET_REFRESH_MS", "5000"))
@@ -92,6 +101,8 @@ SIM_VIDEO1_URL = os.environ.get("MT11_SIM_VIDEO1_URL", f"{SIM_RTSP_BASE}/mt11sim
 SIM_VIDEO2_URL = os.environ.get("MT11_SIM_VIDEO2_URL", f"{SIM_RTSP_BASE}/mt11sim2")
 SIM_SAMPLE_VIDEO = Path(os.environ.get("MT11_SIM_SAMPLE_VIDEO", Path.home() / "Videos" / "sample.mp4")).expanduser()
 STREAM_RECORD_DIR = Path(os.environ.get("MT11_STREAM_RECORD_DIR", Path.home() / "Videos" / "MT11Control")).expanduser()
+VIDEO_CORE_BIN = Path(os.environ.get("MT11_VIDEO_CORE_BIN", ROOT / "video_core" / "build" / "mt11_video_core")).expanduser()
+VIDEO_CORE_ENABLED = os.environ.get("MT11_VIDEO_CORE_ENABLED", "1").strip().lower() not in ("0", "false", "no", "off")
 
 CAMERA_VIEWS = {
     "Zoom + Thermal": "zoom_sub_thermal",
@@ -184,6 +195,7 @@ class FFmpegStreamThread(QThread):
         self.fps = max(1, int(fps))
         self._running = False
         self._process: Optional[subprocess.Popen] = None
+        self._frame_in_flight = False
 
     def run(self):
         if shutil.which("ffmpeg") is None:
@@ -201,6 +213,12 @@ class FFmpegStreamThread(QThread):
             "-hide_banner",
             "-loglevel",
             "warning",
+            "-threads",
+            "1",
+            "-filter_threads",
+            "1",
+            "-filter_complex_threads",
+            "1",
             "-rtsp_transport",
             self.transport,
             "-fflags",
@@ -247,6 +265,9 @@ class FFmpegStreamThread(QThread):
                         self.stalled.emit(self.name)
                     break
 
+                if self._frame_in_flight:
+                    continue
+
                 image = QImage(
                     frame,
                     self.width,
@@ -265,6 +286,7 @@ class FFmpegStreamThread(QThread):
                     got_frame = True
                     self.status_changed.emit("Live")
 
+                self._frame_in_flight = True
                 self.frame_ready.emit(image)
 
         except Exception as exc:
@@ -320,6 +342,124 @@ class FFmpegStreamThread(QThread):
                 pass
 
         self._process = None
+
+    def mark_frame_consumed(self):
+        self._frame_in_flight = False
+
+
+class VideoCoreProcess:
+    def __init__(self, log_callback: Callable[[str], None]):
+        self.log = log_callback
+        self.process: Optional[subprocess.Popen] = None
+        self.reader_thread: Optional[threading.Thread] = None
+        self.available = VIDEO_CORE_ENABLED and VIDEO_CORE_BIN.exists()
+
+    def start(self) -> bool:
+        if not VIDEO_CORE_ENABLED:
+            return False
+        if self.process and self.process.poll() is None:
+            return True
+        if not VIDEO_CORE_BIN.exists():
+            self.available = False
+            return False
+        try:
+            self.process = subprocess.Popen(
+                [str(VIDEO_CORE_BIN)],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                bufsize=1,
+            )
+            self.reader_thread = threading.Thread(target=self._read_events, daemon=True)
+            self.reader_thread.start()
+            self.available = True
+            return True
+        except Exception as exc:
+            self.available = False
+            self.log(f"video core: failed to start: {exc}")
+            return False
+
+    def stop(self):
+        process = self.process
+        if not process:
+            return
+        if process.poll() is not None:
+            self.process = None
+            return
+        try:
+            if process.stdin:
+                process.stdin.write('{"cmd":"quit"}\n')
+                process.stdin.flush()
+        except Exception:
+            pass
+        try:
+            process.wait(timeout=2.0)
+        except Exception:
+            try:
+                process.kill()
+            except Exception:
+                pass
+        self.process = None
+
+    def send(self, payload: Dict[str, object]) -> bool:
+        if not self.start():
+            return False
+        if not self.process or not self.process.stdin:
+            return False
+        try:
+            self.process.stdin.write(json.dumps(payload, separators=(",", ":")) + "\n")
+            self.process.stdin.flush()
+            return True
+        except Exception as exc:
+            self.log(f"video core: send failed: {exc}")
+            self.process = None
+            return False
+
+    def start_relay(self, source: str, output: str, mode: str) -> bool:
+        return self.send({
+            "cmd": "start_relay",
+            "source": source,
+            "output": output,
+            "mode": mode.strip().lower(),
+            "ffmpeg": FPVRelayManager._ffmpeg_bin() or "ffmpeg",
+            "mediamtx": os.environ.get("MT11_MEDIAMTX_BIN") or shutil.which("mediamtx") or "mediamtx",
+        })
+
+    def stop_relay(self) -> bool:
+        if not self.process or self.process.poll() is not None:
+            return False
+        return self.send({"cmd": "stop_relay"})
+
+    def start_record(self, url: str, transport: str, output: Path) -> bool:
+        return self.send({
+            "cmd": "start_record",
+            "url": url,
+            "transport": transport,
+            "output": str(output),
+            "ffmpeg": shutil.which("ffmpeg") or "ffmpeg",
+        })
+
+    def stop_record(self) -> bool:
+        if not self.process or self.process.poll() is not None:
+            return False
+        return self.send({"cmd": "stop_record"})
+
+    def _read_events(self):
+        process = self.process
+        if not process or not process.stdout:
+            return
+        for line in process.stdout:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                event = json.loads(line)
+                name = event.get("event", "event")
+                message = event.get("message", "")
+                self.log(f"video core {name}: {message}")
+            except Exception:
+                self.log(f"video core: {line}")
 
 
 class FPVRelayManager:
@@ -471,6 +611,10 @@ class FPVRelayManager:
         if not source_url:
             self.log("FPV relay: source URL is empty")
             return
+        if not self._source_reachable(source_url):
+            self.log(f"FPV relay: source not reachable, waiting {FPV_RELAY_SOURCE_RETRY_MS / 1000:.0f}s")
+            self._schedule_ffmpeg_restart(FPV_RELAY_SOURCE_RETRY_MS)
+            return
 
         mode = self.mode_getter().strip().lower()
         cmd = [
@@ -582,12 +726,13 @@ class FPVRelayManager:
             self.ffmpeg_process = None
             self._schedule_ffmpeg_restart()
 
-    def _schedule_ffmpeg_restart(self) -> None:
+    def _schedule_ffmpeg_restart(self, delay_ms: Optional[int] = None) -> None:
         if not self.running or self.restart_timer.isActive():
             return
 
         self.ffmpeg_restart_attempts += 1
-        delay_ms = min(10000, 500 * (2 ** min(self.ffmpeg_restart_attempts, 5)))
+        if delay_ms is None:
+            delay_ms = min(FPV_RELAY_RESTART_MAX_MS, 500 * (2 ** min(self.ffmpeg_restart_attempts, 7)))
         self.log(f"FPV relay: reconnecting in {delay_ms / 1000:.1f}s")
         self.restart_timer.start(delay_ms)
 
@@ -620,6 +765,15 @@ class FPVRelayManager:
 
         netloc = f"{host}:{FPV_RELAY_FALLBACK_PORT}"
         return urlunparse((parsed.scheme or "rtsp", netloc, parsed.path or "/cam2", "", "", ""))
+
+    @staticmethod
+    def _source_reachable(url: str) -> bool:
+        parsed = urlparse(url)
+        host = parsed.hostname
+        if not host:
+            return False
+        port = parsed.port or 554
+        return FPVRelayManager._tcp_listening(host, port)
 
     @staticmethod
     def _ffmpeg_bin() -> Optional[str]:
@@ -1386,6 +1540,7 @@ class MT11QtDashboard(QMainWindow):
         self.web_client: Optional[MT11WebClient] = None
         self.fpv_relay: Optional[FPVRelayManager] = None
         self.stream_simulator: Optional[RTSPStreamSimulator] = None
+        self.video_core: Optional[VideoCoreProcess] = None
         self.connected_host = ""
         self.connected_port = 0
         self.connected_ai_host = ""
@@ -1419,6 +1574,7 @@ class MT11QtDashboard(QMainWindow):
         self.record_command_pending = False
         self.stream_record_process: Optional[subprocess.Popen] = None
         self.stream_record_file: Optional[Path] = None
+        self.stream_record_via_core = False
         self.status_refresh_pending = False
         self.laser_refresh_pending = False
         self.video_render_pending = False
@@ -1431,6 +1587,7 @@ class MT11QtDashboard(QMainWindow):
 
         self._build_ui()
         self._apply_style()
+        self.video_core = VideoCoreProcess(self.log_message)
         self.fpv_relay = FPVRelayManager(
             self,
             lambda: self.fpv_source_edit.text(),
@@ -2186,8 +2343,15 @@ class MT11QtDashboard(QMainWindow):
         if self._simulator_enabled():
             if self.stream_simulator:
                 self.stream_simulator.start()
-        elif self.fpv_relay and (self.fpv_relay_check.isChecked() or primary_source["name"] == "FPV Camera"):
-            self.fpv_relay.start()
+        elif self.fpv_relay_check.isChecked() or primary_source["name"] == "FPV Camera":
+            if self.video_core and self.video_core.start_relay(
+                self.fpv_source_edit.text().strip(),
+                self.fpv_relay_url_edit.text().strip(),
+                self.fpv_mode_combo.currentText(),
+            ):
+                self.log_message("FPV relay: managed by video core")
+            elif self.fpv_relay:
+                self.fpv_relay.start()
 
         self.main_thread = self._start_stream(
             primary_source["url"],
@@ -2236,6 +2400,7 @@ class MT11QtDashboard(QMainWindow):
     def _start_stream(self, url: str, width: int, height: int, frame_slot, transport: str = "tcp", name: str = "stream", fps: int = MAIN_STREAM_FPS):
         thread = FFmpegStreamThread(url, width, height, transport=transport, name=name, fps=fps, parent=self)
         thread.frame_ready.connect(frame_slot)
+        thread.frame_ready.connect(lambda _image, stream_thread=thread: stream_thread.mark_frame_consumed())
         thread.status_changed.connect(self.status_badge.setText)
         thread.error.connect(lambda text: self.log_message(f"stream error: {text}"))
         thread.stalled.connect(self._handle_stream_stalled)
@@ -2298,6 +2463,9 @@ class MT11QtDashboard(QMainWindow):
 
         if self.fpv_relay:
             self.fpv_relay.stop()
+
+        if self.video_core:
+            self.video_core.stop_relay()
 
         if self.stream_simulator:
             self.stream_simulator.stop()
@@ -3082,6 +3250,8 @@ class MT11QtDashboard(QMainWindow):
             self.log_message(f"{label}: ERROR {exc}")
 
     def _stream_recording_active(self) -> bool:
+        if self.stream_record_via_core:
+            return True
         return self.stream_record_process is not None and self.stream_record_process.poll() is None
 
     def toggle_stream_recording(self):
@@ -3108,6 +3278,13 @@ class MT11QtDashboard(QMainWindow):
             source_name = "".join(ch if ch.isalnum() else "_" for ch in source["name"].lower()).strip("_")
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             output = STREAM_RECORD_DIR / f"{source_name}_{timestamp}.mkv"
+            if self.video_core and self.video_core.start_record(source["url"], source["transport"], output):
+                self.stream_record_via_core = True
+                self.stream_record_file = output
+                self.stream_record_status_signal.emit("on", output)
+                self.log_message(f"stream record: video core writing {output}")
+                return
+
             cmd = [
                 ffmpeg,
                 "-y",
@@ -3147,10 +3324,19 @@ class MT11QtDashboard(QMainWindow):
                 self.log_message(f"stream record: ffmpeg exited with code {code}")
 
     def _stop_stream_recording(self, reason: str = "stop"):
+        output = self.stream_record_file
+        if self.stream_record_via_core:
+            self.stream_record_via_core = False
+            if self.video_core:
+                self.video_core.stop_record()
+            self.stream_record_status_signal.emit("off", {"file": output, "reason": reason})
+            if output:
+                self.log_message(f"stream record: stopped ({reason}), saved {output}")
+            return
+
         process = self.stream_record_process
         if not process:
             return
-        output = self.stream_record_file
         self.stream_record_process = None
         if process.poll() is None:
             process.terminate()
@@ -3458,6 +3644,9 @@ class MT11QtDashboard(QMainWindow):
 
         if self.ai_client:
             self.ai_client.close()
+
+        if self.video_core:
+            self.video_core.stop()
 
         event.accept()
 

@@ -5,6 +5,8 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VENV_DIR="${VENV_DIR:-${ROOT_DIR}/.venv}"
 INSTALL_MEDIAMTX="${INSTALL_MEDIAMTX:-1}"
 MEDIAMTX_BIN="${MEDIAMTX_BIN:-/usr/local/bin/mediamtx}"
+CLEAN_LEGACY_RTSP="${CLEAN_LEGACY_RTSP:-1}"
+BUILD_VIDEO_CORE="${BUILD_VIDEO_CORE:-1}"
 
 echo "[setup] UniPod MT11 SDK package"
 
@@ -117,6 +119,45 @@ install_mediamtx() {
   trap - RETURN
 }
 
+cleanup_legacy_rtsp_services() {
+  if [[ "${CLEAN_LEGACY_RTSP}" != "1" ]]; then
+    echo "[setup] Skipping legacy RTSP service cleanup because CLEAN_LEGACY_RTSP=${CLEAN_LEGACY_RTSP}"
+    return
+  fi
+
+  if ! need_cmd systemctl; then
+    return
+  fi
+
+  if ! systemctl list-unit-files cam2-restream.service >/dev/null 2>&1; then
+    return
+  fi
+
+  require_sudo
+
+  echo "[setup] Removing legacy cam2-restream.service to avoid duplicate FPV relays"
+  "${SUDO[@]}" systemctl disable --now cam2-restream.service >/dev/null 2>&1 || true
+  "${SUDO[@]}" rm -f /etc/systemd/system/cam2-restream.service
+  "${SUDO[@]}" systemctl daemon-reload
+}
+
+build_video_core() {
+  if [[ "${BUILD_VIDEO_CORE}" != "1" ]]; then
+    echo "[setup] Skipping C++ video core build because BUILD_VIDEO_CORE=${BUILD_VIDEO_CORE}"
+    return
+  fi
+
+  if ! need_cmd cmake || ! need_cmd g++; then
+    echo "[setup] WARNING: cmake and g++ are required to build mt11_video_core."
+    echo "        Install them manually, then rerun setup or set BUILD_VIDEO_CORE=0."
+    return
+  fi
+
+  echo "[setup] Building C++ video core"
+  cmake -S "${ROOT_DIR}/video_core" -B "${ROOT_DIR}/video_core/build"
+  cmake --build "${ROOT_DIR}/video_core/build" --parallel
+}
+
 if ! command -v python3 >/dev/null 2>&1; then
   echo "[setup] ERROR: python3 is required."
   exit 1
@@ -140,6 +181,8 @@ if ! command -v ffmpeg >/dev/null 2>&1; then
 fi
 
 install_mediamtx
+cleanup_legacy_rtsp_services
+build_video_core
 
 echo "[setup] Creating virtual environment: ${VENV_DIR}"
 python3 -m venv "${VENV_DIR}"
@@ -161,3 +204,5 @@ echo
 echo "[setup] Done."
 echo "[setup] Run MT11Control:"
 echo "        ${ROOT_DIR}/run_mt11control.sh"
+echo "[setup] Build AppImage:"
+echo "        ${ROOT_DIR}/install.sh"
