@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import csv
 import math
 import json
 import os
@@ -61,6 +62,7 @@ if str(ROOT) not in sys.path:
 
 from mt11_sdk import AITrackingBox, DEFAULT_AI_IP, DEFAULT_IP, DEFAULT_PORT, MT11AITrackingClient, MT11UDPClient, MT11WebClient
 from mt11_sdk.constants import IMAGE_MODE_BY_NAME, IMAGE_MODES, THERMAL_PALETTES
+from hm30_scrape import request_siyi_rf
 
 
 STREAM_SIZE = (
@@ -94,6 +96,9 @@ FPV_RELAY_SOURCE_RETRY_MS = int(os.environ.get("MT11_FPV_SOURCE_RETRY_MS", "1500
 STATUS_REFRESH_MS = int(os.environ.get("MT11_STATUS_REFRESH_MS", "1000"))
 LASER_RANGE_REFRESH_MS = int(os.environ.get("MT11_LASER_RANGE_REFRESH_MS", "1000"))
 LASER_TARGET_REFRESH_MS = int(os.environ.get("MT11_LASER_TARGET_REFRESH_MS", "5000"))
+DEFAULT_HM30_RF_HOST = os.environ.get("MT11_HM30_RF_HOST", "192.168.144.12")
+DEFAULT_HM30_RF_PORT = int(os.environ.get("MT11_HM30_RF_PORT", "19856"))
+HM30_RF_REFRESH_MS = int(os.environ.get("MT11_HM30_RF_REFRESH_MS", "1000"))
 SIMULATOR_MARKER = Path(os.environ.get("MT11_SIMULATOR_MARKER", Path.home() / ".mt11control_simulator"))
 SIMULATOR_AVAILABLE = os.environ.get("MT11_SIMULATOR_AVAILABLE", "0").strip().lower() in ("1", "true", "yes", "on") or SIMULATOR_MARKER.exists()
 SIM_RTSP_BASE = os.environ.get("MT11_SIM_RTSP_BASE", "rtsp://127.0.0.1:8554")
@@ -135,6 +140,20 @@ def rtsp_url(host: str, stream: int) -> str:
 
 def clamp(value: int, min_value: int, max_value: int) -> int:
     return max(min_value, min(max_value, int(value)))
+
+
+def format_rate(value):
+    if value is None:
+        return "--"
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return "--"
+    if abs(value) >= 1024 * 1024:
+        return f"{value / (1024 * 1024):.1f} MB/s"
+    if abs(value) >= 1024:
+        return f"{value / 1024:.1f} KB/s"
+    return f"{value:.0f} B/s"
 
 
 class CockpitBackground(QWidget):
@@ -1212,10 +1231,44 @@ class VideoStage(QFrame):
         self.pip_label.clicked.connect(self.pip_clicked.emit)
         self.pip_label.hide()
 
+        self.rf_card = QFrame()
+        self.rf_card.setObjectName("rfCard")
+        self.rf_card.setFixedHeight(46)
+        self.rf_card.setMinimumWidth(560)
+        self.rf_card.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+
+        rf_layout = QHBoxLayout(self.rf_card)
+        rf_layout.setContentsMargins(12, 6, 12, 6)
+        rf_layout.setSpacing(12)
+
+        self.rf_signal_label = QLabel("SIG --")
+        self.rf_rssi_label = QLabel("RSSI --")
+        self.rf_channel_label = QLabel("CH --")
+        self.rf_freq_label = QLabel("-- MHz")
+        self.rf_up_label = QLabel("UP --")
+        self.rf_down_label = QLabel("DN --")
+        for label in (
+            self.rf_signal_label,
+            self.rf_rssi_label,
+            self.rf_channel_label,
+            self.rf_freq_label,
+            self.rf_up_label,
+            self.rf_down_label,
+        ):
+            label.setObjectName("rfValue")
+
+        rf_layout.addWidget(self.rf_signal_label)
+        rf_layout.addWidget(self.rf_rssi_label)
+        rf_layout.addWidget(self.rf_channel_label)
+        rf_layout.addWidget(self.rf_freq_label)
+        rf_layout.addWidget(self.rf_up_label)
+        rf_layout.addWidget(self.rf_down_label)
+
         layout = QGridLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(self.main_label, 0, 0)
         layout.addWidget(self.pip_label, 0, 0, Qt.AlignRight | Qt.AlignBottom)
+        layout.addWidget(self.rf_card, 0, 0, Qt.AlignTop | Qt.AlignHCenter)
 
         self._main_pixmap: Optional[QPixmap] = None
         self._pip_pixmap: Optional[QPixmap] = None
@@ -1262,6 +1315,33 @@ class VideoStage(QFrame):
     def set_status_overlay(self, lines):
         self._status_overlay_lines = [line for line in lines if line]
         self._refresh_pixmaps()
+
+    def set_rf_status(self, data):
+        if not data:
+            for label in (
+                self.rf_signal_label,
+                self.rf_rssi_label,
+                self.rf_channel_label,
+                self.rf_freq_label,
+                self.rf_up_label,
+                self.rf_down_label,
+            ):
+                label.setText("--")
+            return
+
+        signal = data.get("signal_pct")
+        rssi = data.get("rssi_dbm")
+        channel = data.get("channel")
+        freq = data.get("freq_mhz")
+        upstream = data.get("upstream_Bps")
+        downstream = data.get("downstream_Bps")
+
+        self.rf_signal_label.setText("SIG --" if signal is None else f"SIG {signal}%")
+        self.rf_rssi_label.setText("RSSI --" if rssi is None else f"RSSI {rssi} dBm")
+        self.rf_channel_label.setText("CH --" if channel is None else f"CH {channel}")
+        self.rf_freq_label.setText("-- MHz" if freq is None else f"{freq} MHz")
+        self.rf_up_label.setText(f"UP {format_rate(upstream)}")
+        self.rf_down_label.setText(f"DN {format_rate(downstream)}")
 
     def set_ai_tracking_box(self, box: Optional[AITrackingBox]):
         return
@@ -1529,6 +1609,7 @@ class MT11QtDashboard(QMainWindow):
     record_status_signal = pyqtSignal(str)
     stream_record_status_signal = pyqtSignal(str, object)
     thermal_result_signal = pyqtSignal(object)
+    rf_status_signal = pyqtSignal(object)
 
     def __init__(self):
         super().__init__()
@@ -1575,8 +1656,12 @@ class MT11QtDashboard(QMainWindow):
         self.stream_record_process: Optional[subprocess.Popen] = None
         self.stream_record_file: Optional[Path] = None
         self.stream_record_via_core = False
+        self.rf_csv_file = None
+        self.rf_csv_writer = None
+        self.rf_csv_path: Optional[Path] = None
         self.status_refresh_pending = False
         self.laser_refresh_pending = False
+        self.rf_refresh_pending = False
         self.video_render_pending = False
         self.streams_requested = False
         self.stream_restart_pending = {"primary": False, "video2": False}
@@ -1611,6 +1696,7 @@ class MT11QtDashboard(QMainWindow):
         self.record_status_signal.connect(self._apply_record_status)
         self.stream_record_status_signal.connect(self._apply_stream_record_status)
         self.thermal_result_signal.connect(self._apply_thermal_result)
+        self.rf_status_signal.connect(self._apply_rf_status)
 
         self._ensure_client()
         QTimer.singleShot(250, self._auto_start_joystick_if_available)
@@ -1622,6 +1708,11 @@ class MT11QtDashboard(QMainWindow):
         self.laser_timer = QTimer(self)
         self.laser_timer.timeout.connect(self.refresh_laser_overlay)
         self.laser_timer.start(LASER_RANGE_REFRESH_MS)
+
+        self.rf_timer = QTimer(self)
+        self.rf_timer.timeout.connect(self.refresh_rf_status)
+        self.rf_timer.start(HM30_RF_REFRESH_MS)
+        QTimer.singleShot(100, lambda: self.refresh_rf_status(force=True))
 
         # Coalesce incoming frames. Without this limiter, two streams can queue
         # more redraws than the UI can present cleanly on field computers.
@@ -2206,9 +2297,17 @@ class MT11QtDashboard(QMainWindow):
         box.layout().addLayout(grid)
 
         refresh = QPushButton("Refresh Status")
-        refresh.clicked.connect(self.refresh_status)
+        refresh.clicked.connect(self.refresh_all_status)
+
+        self.rf_csv_button = QPushButton("Record RF CSV")
+        self.rf_csv_button.clicked.connect(self.toggle_rf_csv_recording)
+
+        self.rf_csv_status_label = QLabel("RF CSV: off")
+        self.rf_csv_status_label.setObjectName("metricLabel")
 
         box.layout().addWidget(refresh)
+        box.layout().addWidget(self.rf_csv_button)
+        box.layout().addWidget(self.rf_csv_status_label)
         return box
 
     def _section(self, title: str):
@@ -3496,6 +3595,68 @@ class MT11QtDashboard(QMainWindow):
 
         self.run_command("thermal palette", lambda: self.client.set_thermal_palette(palette))
 
+    def refresh_all_status(self):
+        self.refresh_status()
+        self.refresh_rf_status(force=True)
+
+    def toggle_rf_csv_recording(self):
+        if self.rf_csv_file:
+            self.stop_rf_csv_recording()
+        else:
+            self.start_rf_csv_recording()
+
+    def start_rf_csv_recording(self):
+        try:
+            STREAM_RECORD_DIR.mkdir(parents=True, exist_ok=True)
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            self.rf_csv_path = STREAM_RECORD_DIR / f"rf_data_{timestamp}.csv"
+            self.rf_csv_file = self.rf_csv_path.open("w", newline="", encoding="utf-8")
+            self.rf_csv_writer = csv.DictWriter(
+                self.rf_csv_file,
+                fieldnames=[
+                    "time_iso",
+                    "ts",
+                    "source",
+                    "seq",
+                    "signal_pct",
+                    "rssi_dbm",
+                    "freq_mhz",
+                    "channel",
+                    "upstream_Bps",
+                    "downstream_Bps",
+                    "tx_bandwidth_mbps",
+                    "rx_bandwidth_mbps",
+                    "inactive_time",
+                ],
+            )
+            self.rf_csv_writer.writeheader()
+            self.rf_csv_file.flush()
+            self.rf_csv_button.setText("Stop RF CSV")
+            self.rf_csv_status_label.setText(f"RF CSV: {self.rf_csv_path.name}")
+            self.log_message(f"RF CSV recording: {self.rf_csv_path}")
+        except Exception as exc:
+            self.rf_csv_file = None
+            self.rf_csv_writer = None
+            self.rf_csv_path = None
+            self.rf_csv_status_label.setText(f"RF CSV: ERROR {exc}")
+            self.log_message(f"RF CSV record error: {exc}")
+
+    def stop_rf_csv_recording(self):
+        path = self.rf_csv_path
+        if self.rf_csv_file:
+            try:
+                self.rf_csv_file.close()
+            except Exception:
+                pass
+
+        self.rf_csv_file = None
+        self.rf_csv_writer = None
+        self.rf_csv_path = None
+        self.rf_csv_button.setText("Record RF CSV")
+        self.rf_csv_status_label.setText("RF CSV: off" if not path else f"RF CSV: saved {path.name}")
+        if path:
+            self.log_message(f"RF CSV saved: {path}")
+
     def refresh_status(self):
         if self.status_refresh_pending:
             return
@@ -3515,6 +3676,34 @@ class MT11QtDashboard(QMainWindow):
         finally:
             self.status_refresh_pending = False
 
+    def refresh_rf_status(self, force: bool = False):
+        if self.rf_refresh_pending:
+            return
+
+        self.rf_refresh_pending = True
+        threading.Thread(target=self._rf_worker, args=(force,), daemon=True).start()
+
+    def _rf_worker(self, force: bool = False):
+        host = DEFAULT_HM30_RF_HOST
+        port = DEFAULT_HM30_RF_PORT
+
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            try:
+                result = request_siyi_rf(sock, (host, port), timeout=0.6)
+            finally:
+                sock.close()
+
+            if result:
+                self.rf_status_signal.emit(result)
+            elif force:
+                self.rf_status_signal.emit({"error": "timeout", "host": host, "port": port})
+        except Exception as exc:
+            if force:
+                self.rf_status_signal.emit({"error": str(exc), "host": host, "port": port})
+        finally:
+            self.rf_refresh_pending = False
+
     def _apply_telemetry(self, attitude, zoom):
         overlay_lines = []
         if attitude:
@@ -3532,6 +3721,59 @@ class MT11QtDashboard(QMainWindow):
 
         if overlay_lines:
             self.video_stage.set_status_overlay(overlay_lines)
+
+    def _apply_rf_status(self, result):
+        if not isinstance(result, dict):
+            return
+
+        error = result.get("error")
+        if error:
+            self.video_stage.set_rf_status(None)
+            return
+
+        data = result.get("decoded") or {}
+        self.video_stage.set_rf_status(data)
+        self._record_rf_csv_row(result, data)
+
+    def _record_rf_csv_row(self, result, data):
+        if not self.rf_csv_writer or not self.rf_csv_file:
+            return
+
+        try:
+            timestamp = float(result.get("ts") or time.time())
+            row = {
+                "time_iso": datetime.fromtimestamp(timestamp).isoformat(timespec="milliseconds"),
+                "ts": f"{timestamp:.3f}",
+                "source": result.get("from", ""),
+                "seq": result.get("seq", ""),
+                "signal_pct": data.get("signal_pct", ""),
+                "rssi_dbm": data.get("rssi_dbm", ""),
+                "freq_mhz": data.get("freq_mhz", ""),
+                "channel": data.get("channel", ""),
+                "upstream_Bps": data.get("upstream_Bps", ""),
+                "downstream_Bps": data.get("downstream_Bps", ""),
+                "tx_bandwidth_mbps": data.get("tx_bandwidth_mbps", ""),
+                "rx_bandwidth_mbps": data.get("rx_bandwidth_mbps", ""),
+                "inactive_time": data.get("inactive_time", ""),
+            }
+            self.rf_csv_writer.writerow(row)
+            self.rf_csv_file.flush()
+        except Exception as exc:
+            self.log_message(f"RF CSV write error: {exc}")
+            self.stop_rf_csv_recording()
+
+    def _format_rate(self, value):
+        if value is None:
+            return "-"
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            return "-"
+        if abs(value) >= 1024 * 1024:
+            return f"{value / (1024 * 1024):.1f} MB/s"
+        if abs(value) >= 1024:
+            return f"{value / 1024:.1f} KB/s"
+        return f"{value:.0f} B/s"
 
     def toggle_joystick(self, enabled: bool):
         if enabled:
@@ -3629,13 +3871,15 @@ class MT11QtDashboard(QMainWindow):
 
     def keyPressEvent(self, event):
         if event.matches(QKeySequence.Refresh):
-            self.refresh_status()
+            self.refresh_all_status()
             return
 
         super().keyPressEvent(event)
 
     def closeEvent(self, event):
         self.laser_timer.stop()
+        self.rf_timer.stop()
+        self.stop_rf_csv_recording()
         self.stop_joystick()
         self.stop_streams()
 
@@ -3853,6 +4097,21 @@ class MT11QtDashboard(QMainWindow):
                 background: #58f7e8;
                 border-radius: 5px;
                 padding: 5px 9px;
+                font-weight: 900;
+            }
+
+            #rfCard {
+                color: #eef3f7;
+                background: rgba(3, 5, 7, 205);
+                border: 1px solid rgba(247, 216, 74, 210);
+                border-radius: 8px;
+                margin-top: 12px;
+            }
+
+            #rfValue {
+                color: #eef3f7;
+                background: transparent;
+                font-size: 12px;
                 font-weight: 900;
             }
 
