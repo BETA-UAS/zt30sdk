@@ -73,7 +73,9 @@ ping 192.168.144.25
 
 ## FPV Relay
 
-When `Auto FPV relay` is enabled, `Connect + Play` starts MediaMTX if needed and publishes the FPV camera to:
+`Auto FPV relay` is disabled by default so normal main-camera operation does
+not pull the additional FPV feed. When it is enabled, `Connect + Play` starts
+MediaMTX if needed and publishes the FPV camera to:
 
 ```text
 rtsp://127.0.0.1:8554/cam2
@@ -90,7 +92,7 @@ You can change the source/output in the Connection panel. For fixed deployments,
 ```bash
 MT11_FPV_SOURCE_URL=rtsp://192.168.144.26:554/
 MT11_FPV_RELAY_URL=rtsp://127.0.0.1:8554/cam2
-MT11_FPV_RELAY_ENABLED=1
+MT11_FPV_RELAY_ENABLED=0
 MT11_FPV_RELAY_MODE=qgc_safe
 MT11_FPV_SAFE_FPS=25
 MT11_FPV_SAFE_BITRATE=2500k

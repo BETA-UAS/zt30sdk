@@ -61,7 +61,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from mt11_sdk import AITrackingBox, DEFAULT_AI_IP, DEFAULT_IP, DEFAULT_PORT, MT11AITrackingClient, MT11UDPClient, MT11WebClient
-from mt11_sdk.constants import IMAGE_MODE_BY_NAME, IMAGE_MODES, THERMAL_PALETTES
+from mt11_sdk.constants import IMAGE_MODE_BY_NAME, IMAGE_MODES, THERMAL_PALETTES, VIDEO_ENCODERS
 from hm30_scrape import request_siyi_rf
 
 
@@ -82,7 +82,8 @@ THERMAL_COORD_SIZE = (640, 512)
 DEFAULT_FPV_SOURCE_URL = os.environ.get("MT11_FPV_SOURCE_URL", "rtsp://192.168.144.26:554/")
 DEFAULT_FPV_RELAY_URL = os.environ.get("MT11_FPV_RELAY_URL", "rtsp://127.0.0.1:8554/cam2")
 FPV_RELAY_FALLBACK_PORT = int(os.environ.get("MT11_FPV_RELAY_FALLBACK_PORT", "8555"))
-FPV_RELAY_ENABLED_DEFAULT = os.environ.get("MT11_FPV_RELAY_ENABLED", "1").strip().lower() not in ("0", "false", "no", "off")
+# Do not consume the FPV camera feed unless the operator explicitly enables it.
+FPV_RELAY_ENABLED_DEFAULT = os.environ.get("MT11_FPV_RELAY_ENABLED", "0").strip().lower() not in ("0", "false", "no", "off")
 FPV_RELAY_MODE_DEFAULT = os.environ.get("MT11_FPV_RELAY_MODE", "qgc_safe").strip().lower()
 FPV_RELAY_SAFE_FPS = int(os.environ.get("MT11_FPV_SAFE_FPS", "25"))
 FPV_RELAY_SAFE_BITRATE = os.environ.get("MT11_FPV_SAFE_BITRATE", "2500k")
@@ -108,6 +109,15 @@ SIM_SAMPLE_VIDEO = Path(os.environ.get("MT11_SIM_SAMPLE_VIDEO", Path.home() / "V
 STREAM_RECORD_DIR = Path(os.environ.get("MT11_STREAM_RECORD_DIR", Path.home() / "Videos" / "MT11Control")).expanduser()
 VIDEO_CORE_BIN = Path(os.environ.get("MT11_VIDEO_CORE_BIN", ROOT / "video_core" / "build" / "mt11_video_core")).expanduser()
 VIDEO_CORE_ENABLED = os.environ.get("MT11_VIDEO_CORE_ENABLED", "1").strip().lower() not in ("0", "false", "no", "off")
+
+STREAM_QUALITY_PRESETS = {
+    "High": {"main": 4000, "sub": 1500},
+    "Balanced": {"main": 1800, "sub": 700},
+    "Low Bandwidth": {"main": 800, "sub": 350},
+}
+DEFAULT_STREAM_QUALITY = os.environ.get("MT11_STREAM_QUALITY", "Balanced").strip().title()
+if DEFAULT_STREAM_QUALITY not in STREAM_QUALITY_PRESETS:
+    DEFAULT_STREAM_QUALITY = "Balanced"
 
 CAMERA_VIEWS = {
     "Zoom + Thermal": "zoom_sub_thermal",
@@ -1608,6 +1618,7 @@ class MT11QtDashboard(QMainWindow):
     media_list_signal = pyqtSignal(object, object)
     record_status_signal = pyqtSignal(str)
     stream_record_status_signal = pyqtSignal(str, object)
+    stream_quality_status_signal = pyqtSignal(str, object)
     thermal_result_signal = pyqtSignal(object)
     rf_status_signal = pyqtSignal(object)
 
@@ -1695,6 +1706,7 @@ class MT11QtDashboard(QMainWindow):
         self.media_list_signal.connect(self._apply_media_list)
         self.record_status_signal.connect(self._apply_record_status)
         self.stream_record_status_signal.connect(self._apply_stream_record_status)
+        self.stream_quality_status_signal.connect(self._apply_stream_quality_status)
         self.thermal_result_signal.connect(self._apply_thermal_result)
         self.rf_status_signal.connect(self._apply_rf_status)
 
@@ -2080,6 +2092,27 @@ class MT11QtDashboard(QMainWindow):
         view_row.addWidget(apply_view)
 
         box.layout().addLayout(view_row)
+
+        self.stream_quality_combo = QComboBox()
+        self.stream_quality_combo.addItems(STREAM_QUALITY_PRESETS.keys())
+        self.stream_quality_combo.setCurrentText(DEFAULT_STREAM_QUALITY)
+        self.stream_quality_combo.setToolTip(
+            "Adjust camera RTSP bitrates while preserving the current codec and resolution"
+        )
+
+        self.stream_quality_button = QPushButton("Apply Quality")
+        self.stream_quality_button.clicked.connect(self.apply_stream_quality)
+
+        quality_row = QHBoxLayout()
+        quality_row.addWidget(QLabel("Stream"))
+        quality_row.addWidget(self.stream_quality_combo, 1)
+        quality_row.addWidget(self.stream_quality_button)
+        box.layout().addLayout(quality_row)
+
+        self.stream_quality_status = QLabel(f"Quality: {DEFAULT_STREAM_QUALITY} (not applied)")
+        self.stream_quality_status.setObjectName("metricLabel")
+        self.stream_quality_status.setWordWrap(True)
+        box.layout().addWidget(self.stream_quality_status)
 
         self.palette_combo = QComboBox()
         self.palette_combo.addItems(THERMAL_NAMES.keys())
