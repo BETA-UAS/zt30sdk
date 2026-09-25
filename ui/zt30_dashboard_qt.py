@@ -13,6 +13,7 @@ import sys
 import threading
 import time
 import webbrowser
+from datetime import datetime
 from pathlib import Path
 from typing import Callable, Optional
 from urllib.parse import urlparse
@@ -59,10 +60,20 @@ from siyi_zt30 import AITrackingBox, DEFAULT_AI_IP, DEFAULT_IP, DEFAULT_PORT, Si
 from siyi_zt30.constants import IMAGE_MODE_BY_NAME, IMAGE_MODES, THERMAL_PALETTES
 
 
-STREAM_SIZE = (960, 540)
-PIP_STREAM_SIZE = (480, 270)
-MAIN_STREAM_FPS = 15
-PIP_STREAM_FPS = 8
+STREAM_SIZE = (
+    int(os.environ.get("ZT30_MAIN_STREAM_WIDTH", "960")),
+    int(os.environ.get("ZT30_MAIN_STREAM_HEIGHT", "540")),
+)
+PIP_STREAM_SIZE = (
+    int(os.environ.get("ZT30_PIP_STREAM_WIDTH", "480")),
+    int(os.environ.get("ZT30_PIP_STREAM_HEIGHT", "270")),
+)
+MAIN_STREAM_FPS = max(1, int(os.environ.get("ZT30_MAIN_STREAM_FPS", "24")))
+PIP_STREAM_FPS = max(1, int(os.environ.get("ZT30_PIP_STREAM_FPS", "8")))
+VIDEO_RENDER_INTERVAL_MS = max(1, round(1000 / MAIN_STREAM_FPS))
+STREAM_RECORD_DIR = Path(
+    os.environ.get("ZT30_STREAM_RECORD_DIR", Path.home() / "Videos" / "ZT30Control")
+).expanduser()
 PIP_SIZE_DEFAULT = (320, 180)
 AI_COORD_SIZE = (1280, 720)
 THERMAL_COORD_SIZE = (640, 512)
@@ -161,6 +172,7 @@ class FFmpegStreamThread(QThread):
         self.fps = max(1, int(fps))
         self._running = False
         self._process: Optional[subprocess.Popen] = None
+        self._frame_in_flight = False
 
     def run(self):
         if shutil.which("ffmpeg") is None:
@@ -178,6 +190,12 @@ class FFmpegStreamThread(QThread):
             "-hide_banner",
             "-loglevel",
             "warning",
+            "-threads",
+            "1",
+            "-filter_threads",
+            "1",
+            "-filter_complex_threads",
+            "1",
             "-rtsp_transport",
             self.transport,
             "-fflags",
@@ -208,7 +226,7 @@ class FFmpegStreamThread(QThread):
                 bufsize=frame_bytes * 2,
             )
 
-            self.status_changed.emit("Live")
+            got_frame = False
 
             while self._running and self._process.stdout is not None:
                 try:
@@ -219,7 +237,16 @@ class FFmpegStreamThread(QThread):
                     break
 
                 if frame is None:
+                    if self._running:
+                        self.error.emit(f"{self.name}: disconnected")
+                        self.stalled.emit(self.name)
                     break
+
+                # Keep at most one decoded frame queued for the GUI. The pipe
+                # still drains continuously, so latency stays bounded when the
+                # UI is temporarily busy drawing overlays or resizing.
+                if self._frame_in_flight:
+                    continue
 
                 image = QImage(
                     frame,
@@ -235,6 +262,11 @@ class FFmpegStreamThread(QThread):
                     )
                     continue
 
+                if not got_frame:
+                    got_frame = True
+                    self.status_changed.emit("Live")
+
+                self._frame_in_flight = True
                 self.frame_ready.emit(image)
 
         except Exception as exc:
@@ -290,6 +322,9 @@ class FFmpegStreamThread(QThread):
                 pass
 
         self._process = None
+
+    def mark_frame_consumed(self):
+        self._frame_in_flight = False
 
 
 class JoystickThread(QThread):
@@ -761,6 +796,7 @@ class ZT30QtDashboard(QMainWindow):
     ai_status_signal = pyqtSignal(str)
     media_list_signal = pyqtSignal(object, object)
     record_status_signal = pyqtSignal(str)
+    stream_record_status_signal = pyqtSignal(str, object)
     thermal_result_signal = pyqtSignal(object)
 
     def __init__(self):
@@ -792,9 +828,14 @@ class ZT30QtDashboard(QMainWindow):
         self._updating_sources = False
         self.recording = False
         self.record_command_pending = False
+        self.stream_record_process: Optional[subprocess.Popen] = None
+        self.stream_record_file: Optional[Path] = None
         self.status_refresh_pending = False
         self.laser_refresh_pending = False
         self.video_render_pending = False
+        self.streams_requested = False
+        self.stream_restart_pending = {"primary": False, "video2": False}
+        self.stream_reconnect_attempts = {"primary": 0, "video2": 0}
         self.thermal_tool_enabled = False
         self.pre_thermal_source = None
         self.pre_thermal_view = None
@@ -809,6 +850,7 @@ class ZT30QtDashboard(QMainWindow):
         self.ai_status_signal.connect(self._apply_ai_status)
         self.media_list_signal.connect(self._apply_media_list)
         self.record_status_signal.connect(self._apply_record_status)
+        self.stream_record_status_signal.connect(self._apply_stream_record_status)
         self.thermal_result_signal.connect(self._apply_thermal_result)
 
         self._ensure_client()
@@ -1003,26 +1045,43 @@ class ZT30QtDashboard(QMainWindow):
 
     def _build_quick_actions(self):
         box = self._section("Quick Actions")
-        row = QHBoxLayout()
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(8)
+        grid.setVerticalSpacing(8)
 
         photo = QPushButton("Photo")
         photo.clicked.connect(lambda: self.run_command("photo", self.client.take_photo))
 
-        self.record_button = QPushButton("Start Record")
+        self.record_button = QPushButton("Cam Rec")
         self.record_button.clicked.connect(self.toggle_record)
+        self.record_button.setToolTip("Start/stop recording on the camera TF card")
 
-        self.record_indicator = QLabel("● NOT RECORDING")
+        self.record_indicator = QLabel("CAM: OFF")
         self.record_indicator.setObjectName("recordIndicator")
 
-        focus = QPushButton("Auto Focus")
+        self.stream_record_button = QPushButton("Stream Rec")
+        self.stream_record_button.clicked.connect(self.toggle_stream_recording)
+        self.stream_record_button.setToolTip("Record the currently selected RTSP stream locally without re-encoding")
+
+        self.stream_record_indicator = QLabel("STREAM: OFF")
+        self.stream_record_indicator.setObjectName("recordIndicator")
+
+        focus = QPushButton("AF")
+        focus.setToolTip("Auto focus")
         focus.clicked.connect(lambda: self.run_command("auto focus", self.client.auto_focus))
 
-        row.addWidget(photo)
-        row.addWidget(self.record_button)
-        row.addWidget(focus)
+        for button in (photo, focus, self.record_button, self.stream_record_button):
+            button.setMinimumWidth(0)
+            button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
-        box.layout().addLayout(row)
+        grid.addWidget(photo, 0, 0)
+        grid.addWidget(focus, 0, 1)
+        grid.addWidget(self.record_button, 1, 0)
+        grid.addWidget(self.stream_record_button, 1, 1)
+
+        box.layout().addLayout(grid)
         box.layout().addWidget(self.record_indicator)
+        box.layout().addWidget(self.stream_record_indicator)
         return box
 
     def _build_gimbal_controls(self):
@@ -1481,6 +1540,9 @@ class ZT30QtDashboard(QMainWindow):
         self.primary_frame = None
         self.video2_frame = None
         self.primary_on_main = True
+        self.streams_requested = True
+        self.stream_restart_pending = {"primary": False, "video2": False}
+        self.stream_reconnect_attempts = {"primary": 0, "video2": 0}
 
         self.main_thread = self._start_stream(
             primary_source["url"],
@@ -1528,6 +1590,7 @@ class ZT30QtDashboard(QMainWindow):
     def _start_stream(self, url: str, width: int, height: int, frame_slot, transport: str = "tcp", name: str = "stream", fps: int = MAIN_STREAM_FPS):
         thread = FFmpegStreamThread(url, width, height, transport=transport, name=name, fps=fps, parent=self)
         thread.frame_ready.connect(frame_slot)
+        thread.frame_ready.connect(lambda _image, stream_thread=thread: stream_thread.mark_frame_consumed())
         thread.status_changed.connect(self.status_badge.setText)
         thread.error.connect(lambda text: self.log_message(f"stream error: {text}"))
         thread.stalled.connect(self._handle_stream_stalled)
@@ -1538,11 +1601,13 @@ class ZT30QtDashboard(QMainWindow):
     def _handle_source_frame(self, source: str, image: QImage):
         if source == "primary":
             self.primary_frame = image
+            self.stream_reconnect_attempts["primary"] = 0
         elif source == "video2":
             self.video2_frame = image
+            self.stream_reconnect_attempts["video2"] = 0
         self.video_render_pending = True
         if not self.video_render_timer.isActive():
-            self.video_render_timer.start(66)
+            self.video_render_timer.start(VIDEO_RENDER_INTERVAL_MS)
 
     def _flush_video_render(self):
         if not self.video_render_pending:
@@ -1563,6 +1628,10 @@ class ZT30QtDashboard(QMainWindow):
             self.video_stage.set_pip_frame(pip_frame)
 
     def stop_streams(self):
+        self._stop_stream_recording("stream stopped")
+        self.streams_requested = False
+        self.stream_restart_pending = {"primary": False, "video2": False}
+
         if self.main_thread:
             self.main_thread.stop()
             self.main_thread = None
@@ -1583,13 +1652,54 @@ class ZT30QtDashboard(QMainWindow):
             self._set_ai_rtsp_enabled(False)
 
     def _handle_stream_stalled(self, name: str):
-        if name != "video2":
+        if name not in ("primary", "video2") or not self.streams_requested:
             return
 
-        self.log_message("video2 stream stalled: restarting PiP")
-        QTimer.singleShot(250, self._restart_pip_stream)
+        if name == "video2" and not self.pip_check.isChecked():
+            return
+
+        if self.stream_restart_pending.get(name):
+            return
+
+        self.stream_reconnect_attempts[name] = self.stream_reconnect_attempts.get(name, 0) + 1
+        delay_ms = min(5000, 250 * (2 ** min(self.stream_reconnect_attempts[name], 5)))
+        self.stream_restart_pending[name] = True
+        self.log_message(f"{name} stream lost: reconnecting in {delay_ms / 1000:.1f}s")
+        QTimer.singleShot(delay_ms, lambda stream_name=name: self._restart_stream(stream_name))
+
+    def _restart_stream(self, name: str):
+        self.stream_restart_pending[name] = False
+
+        if not self.streams_requested:
+            return
+
+        if name == "primary":
+            if self.main_thread:
+                self.main_thread.stop()
+                self.main_thread = None
+
+            try:
+                primary_source = self._source_spec(self.main_source_combo.currentText())
+            except Exception as exc:
+                self.log_message(f"primary restart: ERROR {exc}")
+                return
+
+            self.primary_frame = None
+            self._render_video_layout()
+            self.main_thread = self._start_stream(
+                primary_source["url"],
+                *STREAM_SIZE,
+                lambda image: self._handle_source_frame("primary", image),
+                transport=primary_source["transport"],
+                name="primary",
+                fps=MAIN_STREAM_FPS,
+            )
+            return
+
+        self._restart_pip_stream()
 
     def _restart_pip_stream(self):
+        self.stream_restart_pending["video2"] = False
         if self.pip_thread:
             self.pip_thread.stop()
             self.pip_thread = None
@@ -2168,6 +2278,128 @@ class ZT30QtDashboard(QMainWindow):
         except Exception as exc:
             self.log_message(f"{label}: ERROR {exc}")
 
+    def _stream_recording_active(self) -> bool:
+        return self.stream_record_process is not None and self.stream_record_process.poll() is None
+
+    def toggle_stream_recording(self):
+        if self._stream_recording_active():
+            self._stop_stream_recording("manual stop")
+        else:
+            self._start_stream_recording()
+
+    def _start_stream_recording(self):
+        if self._stream_recording_active():
+            return
+        if not self.streams_requested:
+            self.log_message("stream record: start Connect + Play first")
+            return
+
+        ffmpeg = shutil.which("ffmpeg")
+        if not ffmpeg:
+            self.log_message("stream record: ffmpeg not found")
+            self.stream_record_status_signal.emit("error", "ffmpeg not found")
+            return
+
+        try:
+            source_name = self.main_source_combo.currentText() if self.primary_on_main else "Video 2"
+            source = self._source_spec(source_name)
+            STREAM_RECORD_DIR.mkdir(parents=True, exist_ok=True)
+            safe_name = "".join(ch if ch.isalnum() else "_" for ch in source["name"].lower()).strip("_")
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            output = STREAM_RECORD_DIR / f"{safe_name}_{timestamp}.mp4"
+
+            # Remux the encoded RTSP video instead of decoding and encoding it
+            # again. Fragmented MP4 remains playable even if capture is
+            # interrupted before a traditional MP4 trailer can be written.
+            cmd = [
+                ffmpeg,
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "warning",
+                "-rtsp_transport",
+                source["transport"],
+                "-i",
+                source["url"],
+                "-map",
+                "0:v:0",
+                "-an",
+                "-c:v",
+                "copy",
+                "-avoid_negative_ts",
+                "make_zero",
+                "-movflags",
+                "+frag_keyframe+empty_moov+default_base_moof",
+                str(output),
+            ]
+            process = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            self.stream_record_process = process
+            self.stream_record_file = output
+            self.stream_record_status_signal.emit("on", output)
+            threading.Thread(
+                target=self._monitor_stream_recording,
+                args=(process, output),
+                daemon=True,
+            ).start()
+            self.log_message(f"stream record: writing {output}")
+        except Exception as exc:
+            self.log_message(f"stream record: ERROR {exc}")
+            self.stream_record_status_signal.emit("error", str(exc))
+
+    def _monitor_stream_recording(self, process: subprocess.Popen, output: Path):
+        code = process.wait()
+        if self.stream_record_process is process:
+            self.stream_record_process = None
+            status = "off" if code == 0 else "error"
+            self.stream_record_status_signal.emit(status, {"file": output, "code": code})
+            if code == 0:
+                self.log_message(f"stream record: saved {output}")
+            else:
+                self.log_message(f"stream record: ffmpeg exited with code {code}")
+
+    def _stop_stream_recording(self, reason: str = "stop"):
+        process = self.stream_record_process
+        if not process:
+            return
+
+        output = self.stream_record_file
+        self.stream_record_process = None
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=4)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=2)
+
+        self.stream_record_status_signal.emit("off", {"file": output, "reason": reason})
+        if output:
+            self.log_message(f"stream record: stopped ({reason}), saved {output}")
+
+    def _apply_stream_record_status(self, status: str, detail):
+        if status == "on":
+            self.stream_record_button.setText("Stop Stream")
+            if detail:
+                self.stream_record_indicator.setToolTip(str(detail))
+            self.stream_record_indicator.setText("STREAM: REC")
+            self.stream_record_indicator.setProperty("recording", True)
+        elif status == "error":
+            self.stream_record_button.setText("Stream Rec")
+            self.stream_record_indicator.setToolTip(str(detail) if detail else "")
+            self.stream_record_indicator.setText("STREAM: ERROR")
+            self.stream_record_indicator.setProperty("recording", False)
+        else:
+            self.stream_record_button.setText("Stream Rec")
+            filename = None
+            if isinstance(detail, dict) and detail.get("file"):
+                filename = Path(detail["file"]).name
+                self.stream_record_indicator.setToolTip(str(detail["file"]))
+            self.stream_record_indicator.setText("STREAM: SAVED" if filename else "STREAM: OFF")
+            self.stream_record_indicator.setProperty("recording", False)
+
+        self.stream_record_indicator.style().unpolish(self.stream_record_indicator)
+        self.stream_record_indicator.style().polish(self.stream_record_indicator)
+
     def toggle_record(self):
         if self.record_command_pending:
             return
@@ -2177,7 +2409,7 @@ class ZT30QtDashboard(QMainWindow):
 
         self.record_command_pending = True
         self.record_button.setEnabled(False)
-        self.record_indicator.setText("● CHECKING RECORD STATUS")
+        self.record_indicator.setText("CAM: CHECK")
         threading.Thread(target=self._toggle_record_worker, daemon=True).start()
 
     def _toggle_record_worker(self):
@@ -2210,26 +2442,26 @@ class ZT30QtDashboard(QMainWindow):
 
         if status == "on":
             self.recording = True
-            self.record_button.setText("Stop Record")
-            self.record_indicator.setText("● RECORDING")
+            self.record_button.setText("Stop Cam")
+            self.record_indicator.setText("CAM: REC")
             self.record_indicator.setProperty("recording", True)
         elif status == "off":
             self.recording = False
-            self.record_button.setText("Start Record")
-            self.record_indicator.setText("● NOT RECORDING")
+            self.record_button.setText("Cam Rec")
+            self.record_indicator.setText("CAM: OFF")
             self.record_indicator.setProperty("recording", False)
         elif status == "tf_empty":
             self.recording = False
-            self.record_button.setText("Start Record")
-            self.record_indicator.setText("● TF CARD NOT AVAILABLE")
+            self.record_button.setText("Cam Rec")
+            self.record_indicator.setText("CAM: NO TF")
             self.record_indicator.setProperty("recording", False)
         elif status == "tf_data_loss":
             self.recording = False
-            self.record_button.setText("Start Record")
-            self.record_indicator.setText("● TF CARD DATA ERROR")
+            self.record_button.setText("Cam Rec")
+            self.record_indicator.setText("CAM: TF ERROR")
             self.record_indicator.setProperty("recording", False)
         else:
-            self.record_indicator.setText("● RECORD STATUS UNKNOWN")
+            self.record_indicator.setText("CAM: UNKNOWN")
             self.record_indicator.setProperty("recording", False)
 
         # Dynamic Qt properties require an explicit style refresh.

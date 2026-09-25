@@ -90,6 +90,7 @@ The included PyQt5 dashboard provides:
 - Live attitude telemetry
 - Zoom and focus controls
 - Photo and record buttons
+- Local MP4 stream recording without video re-encoding
 - Camera view selector with common names
 - SIYI AI Tracking Module II controls
 - Click-to-track target selection on the live view
@@ -99,6 +100,7 @@ The included PyQt5 dashboard provides:
 - Full image and point thermometric request
 - Maintenance buttons
 - Embedded RTSP playback through `ffmpeg`, with optional external `ffplay`
+- Bounded frame queue and automatic stream reconnect for smoother playback
 
 ## Requirements
 
@@ -124,6 +126,26 @@ python3 -m pip install PyQt5
 ```
 
 If `ffplay` is available from the FFmpeg package, the dashboard can also open a stream in an external FFplay window.
+
+Local stream recordings are written to `~/Videos/ZT30Control` by default. Start
+the live view, then use **Stream Rec** to record whichever source is displayed
+in the main view. The recorder remuxes the original encoded stream directly to
+fragmented MP4, so it avoids the CPU cost and quality loss of re-encoding.
+
+Playback defaults to a 960x540 main preview at 24 FPS and a 480x270 PiP preview
+at 8 FPS. On smaller companion computers these can be tuned without editing the
+application:
+
+```bash
+ZT30_MAIN_STREAM_WIDTH=640 \
+ZT30_MAIN_STREAM_HEIGHT=360 \
+ZT30_MAIN_STREAM_FPS=20 \
+ZT30_PIP_STREAM_WIDTH=320 \
+ZT30_PIP_STREAM_HEIGHT=180 \
+ZT30_PIP_STREAM_FPS=6 \
+ZT30_STREAM_RECORD_DIR="$HOME/Videos/ZT30" \
+python3 ui/zt30_dashboard_qt.py
+```
 
 ## Quick setup
 
