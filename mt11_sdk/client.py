@@ -400,10 +400,24 @@ class MT11UDPClient:
         stream, enc, width, height, bitrate, frame_rate = struct.unpack("<BBHHHB", pkt.payload[:9])
         return CodecSpec(stream, enc, width, height, bitrate, frame_rate)
 
-    def set_codec_specs(self, stream_type: int | str, encoder: int | str, width: int, height: int, bitrate_kbps: int) -> Optional[bool]:
+    def set_codec_specs(
+        self,
+        stream_type: int | str,
+        encoder: int | str,
+        width: int,
+        height: int,
+    ) -> Optional[bool]:
         st = STREAM_TYPE_BY_NAME.get(stream_type, stream_type) if isinstance(stream_type, str) else int(stream_type)
         enc = VIDEO_ENCODER_BY_NAME.get(encoder, encoder) if isinstance(encoder, str) else int(encoder)
-        payload = struct.pack("<BBHHHB", st, enc, int(width), int(height), int(bitrate_kbps), 0)
+        payload = struct.pack(
+            "<BBHHHB",
+            st,
+            enc,
+            int(width),
+            int(height),
+            0,  # VideoBitrate is reserved and must be zero in SDK V0.2.3.
+            0,  # Reserved.
+        )
         pkt = self.send(0x21, payload)
         if not pkt or len(pkt.payload) < 2:
             return None

@@ -111,13 +111,13 @@ VIDEO_CORE_BIN = Path(os.environ.get("MT11_VIDEO_CORE_BIN", ROOT / "video_core" 
 VIDEO_CORE_ENABLED = os.environ.get("MT11_VIDEO_CORE_ENABLED", "1").strip().lower() not in ("0", "false", "no", "off")
 
 STREAM_QUALITY_PRESETS = {
-    "High": {"main": 4000, "sub": 1500},
-    "Balanced": {"main": 1800, "sub": 700},
-    "Low Bandwidth": {"main": 800, "sub": 350},
+    "High": {"main": (3840, 2160), "sub": (1920, 1080)},
+    "Balanced": {"main": (1920, 1080), "sub": (1280, 720)},
+    "Low Bandwidth": {"main": (1280, 720), "sub": (1280, 720)},
 }
-DEFAULT_STREAM_QUALITY = os.environ.get("MT11_STREAM_QUALITY", "Balanced").strip().title()
+DEFAULT_STREAM_QUALITY = os.environ.get("MT11_STREAM_QUALITY", "Low Bandwidth").strip().title()
 if DEFAULT_STREAM_QUALITY not in STREAM_QUALITY_PRESETS:
-    DEFAULT_STREAM_QUALITY = "Balanced"
+    DEFAULT_STREAM_QUALITY = "Low Bandwidth"
 
 CAMERA_VIEWS = {
     "Zoom + Thermal": "zoom_sub_thermal",
@@ -1677,6 +1677,9 @@ class MT11QtDashboard(QMainWindow):
         self.streams_requested = False
         self.stream_restart_pending = {"primary": False, "video2": False}
         self.stream_reconnect_attempts = {"primary": 0, "video2": 0}
+        self.stream_quality_applied = False
+        self.stream_quality_applying = False
+        self.stream_start_after_quality = False
         self.thermal_tool_enabled = False
         self.pre_thermal_source = None
         self.pre_thermal_view = None
@@ -2096,15 +2099,16 @@ class MT11QtDashboard(QMainWindow):
         self.stream_quality_combo = QComboBox()
         self.stream_quality_combo.addItems(STREAM_QUALITY_PRESETS.keys())
         self.stream_quality_combo.setCurrentText(DEFAULT_STREAM_QUALITY)
+        self.stream_quality_combo.currentTextChanged.connect(self._mark_stream_quality_pending)
         self.stream_quality_combo.setToolTip(
-            "Adjust camera RTSP bitrates while preserving the current codec and resolution"
+            "Adjust camera RTSP resolution while preserving the current codec"
         )
 
         self.stream_quality_button = QPushButton("Apply Quality")
         self.stream_quality_button.clicked.connect(self.apply_stream_quality)
 
         quality_row = QHBoxLayout()
-        quality_row.addWidget(QLabel("Stream"))
+        quality_row.addWidget(QLabel("Resolution"))
         quality_row.addWidget(self.stream_quality_combo, 1)
         quality_row.addWidget(self.stream_quality_button)
         box.layout().addLayout(quality_row)
@@ -2399,6 +2403,7 @@ class MT11QtDashboard(QMainWindow):
             self.client = MT11UDPClient(host, port)
             self.connected_host = host
             self.connected_port = port
+            self.stream_quality_applied = False
             self.log_message(f"UDP ready: {host}:{port}")
             QTimer.singleShot(250, self._auto_start_joystick_if_available)
             return True
@@ -2456,6 +2461,23 @@ class MT11QtDashboard(QMainWindow):
             return False
 
     def start_streams(self):
+        should_apply_quality = (
+            not self._simulator_enabled()
+            and self.main_source_combo.currentText() != "FPV Camera"
+            and not self.stream_quality_applied
+        )
+        if should_apply_quality:
+            self.stream_start_after_quality = True
+            if self.stream_quality_applying:
+                return
+            if self._ensure_client():
+                self._begin_stream_quality_apply(self.stream_quality_combo.currentText())
+                return
+            self.stream_start_after_quality = False
+
+        self._start_streams_now()
+
+    def _start_streams_now(self):
         self.stop_streams()
 
         try:
@@ -3614,6 +3636,135 @@ class MT11QtDashboard(QMainWindow):
             return
 
         self.run_command("camera view", lambda: self.client.set_image_mode(mode))
+
+    def apply_stream_quality(self):
+        if not self._ensure_client():
+            self.stream_quality_status.setText("Quality: camera not connected")
+            return
+
+        preset_name = self.stream_quality_combo.currentText()
+        if preset_name not in STREAM_QUALITY_PRESETS:
+            self.stream_quality_status.setText("Quality: invalid preset")
+            return
+
+        self._begin_stream_quality_apply(preset_name)
+
+    def _begin_stream_quality_apply(self, preset_name: str):
+        if self.stream_quality_applying:
+            return
+        self.stream_quality_applying = True
+        self.stream_quality_combo.setEnabled(False)
+        self.stream_quality_button.setEnabled(False)
+        self.stream_quality_status.setText(f"Quality: applying {preset_name}...")
+        threading.Thread(
+            target=self._stream_quality_worker,
+            args=(preset_name,),
+            daemon=True,
+        ).start()
+
+    def _stream_quality_worker(self, preset_name: str):
+        preset = STREAM_QUALITY_PRESETS[preset_name]
+        before = {}
+
+        try:
+            for stream_name in ("main", "sub"):
+                specs = self.client.request_codec_specs(stream_name)
+                if not specs:
+                    raise RuntimeError(f"no codec response for {stream_name} stream")
+                before[stream_name] = specs
+
+            for stream_name in ("main", "sub"):
+                specs = before[stream_name]
+                width, height = preset[stream_name]
+                accepted = self.client.set_codec_specs(
+                    stream_name,
+                    specs.encoder,
+                    width,
+                    height,
+                )
+                if accepted is not True:
+                    raise RuntimeError(f"camera rejected {stream_name} resolution")
+
+            time.sleep(0.25)
+            after = {}
+            for stream_name in ("main", "sub"):
+                specs = self.client.request_codec_specs(stream_name)
+                if not specs:
+                    raise RuntimeError(f"cannot verify {stream_name} stream")
+                after[stream_name] = specs
+                expected_width, expected_height = preset[stream_name]
+                original = before[stream_name]
+                if (
+                    specs.width != expected_width
+                    or specs.height != expected_height
+                    or specs.encoder != original.encoder
+                ):
+                    raise RuntimeError(
+                        f"{stream_name} verification failed: requested "
+                        f"{expected_width}x{expected_height} with codec unchanged, "
+                        f"camera reports {self._format_codec_spec(specs)}"
+                    )
+
+            detail = {
+                "preset": preset_name,
+                "main": self._format_codec_spec(after["main"]),
+                "sub": self._format_codec_spec(after["sub"]),
+            }
+            self.ai_command_size_cache_time = 0.0
+            self.stream_quality_status_signal.emit("ok", detail)
+        except Exception as exc:
+            rollback_errors = []
+            for stream_name, specs in before.items():
+                try:
+                    restored = self.client.set_codec_specs(
+                        stream_name,
+                        specs.encoder,
+                        specs.width,
+                        specs.height,
+                    )
+                    if restored is not True:
+                        rollback_errors.append(stream_name)
+                except Exception:
+                    rollback_errors.append(stream_name)
+
+            message = str(exc)
+            if rollback_errors:
+                message += f"; rollback uncertain for {', '.join(rollback_errors)}"
+            self.stream_quality_status_signal.emit("error", message)
+
+    @staticmethod
+    def _format_codec_spec(specs) -> str:
+        encoder = VIDEO_ENCODERS.get(specs.encoder, f"codec-{specs.encoder}").upper()
+        return f"{specs.width}x{specs.height} {encoder}"
+
+    def _mark_stream_quality_pending(self):
+        self.stream_quality_applied = False
+        if hasattr(self, "stream_quality_status") and not self.stream_quality_applying:
+            self.stream_quality_status.setText(
+                f"Quality: {self.stream_quality_combo.currentText()} (not applied)"
+            )
+
+    def _apply_stream_quality_status(self, status: str, detail):
+        self.stream_quality_applying = False
+        self.stream_quality_combo.setEnabled(True)
+        self.stream_quality_button.setEnabled(True)
+        if status == "ok":
+            self.stream_quality_applied = True
+            preset_name = detail["preset"]
+            self.stream_quality_status.setText(
+                f"Quality: {preset_name} | Main {detail['main']} | Sub {detail['sub']}"
+            )
+            self.log_message(
+                f"stream quality {preset_name}: main {detail['main']}; sub {detail['sub']}"
+            )
+        else:
+            self.stream_quality_applied = False
+            self.stream_quality_status.setText(f"Quality: ERROR {detail}")
+            self.log_message(f"stream quality: ERROR {detail}")
+
+        if self.stream_start_after_quality:
+            self.stream_start_after_quality = False
+            QTimer.singleShot(0, self._start_streams_now)
 
     def apply_palette(self):
         palette = THERMAL_NAMES[self.palette_combo.currentText()]

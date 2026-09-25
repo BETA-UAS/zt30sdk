@@ -131,6 +131,28 @@ For low-spec field computers, stream load can be tuned without editing source:
 MT11_MAIN_STREAM_FPS=20 MT11_MAIN_STREAM_WIDTH=854 MT11_MAIN_STREAM_HEIGHT=480 ./run_mt11control.sh
 ```
 
+## Stream quality presets
+
+The Camera panel provides three RTSP resolution presets. `Low Bandwidth` is the
+default and is applied automatically before normal camera streaming starts:
+
+| Preset | Main stream | Substream |
+| --- | ---: | ---: |
+| High | 3840x2160 | 1920x1080 |
+| Balanced | 1920x1080 | 1280x720 |
+| Low Bandwidth | 1280x720 | 1280x720 |
+
+MT11Control preserves each stream's current H.264/H.265 codec, reads the result
+back from the camera, and restores the previous codec and resolution when
+applying or verification fails. The initial selection can be overridden with
+`MT11_STREAM_QUALITY`.
+
+SDK V0.2.3 does not support setting an explicit bitrate or frame rate with
+command `0x21`; both reserved fields are sent as zero. Lower resolution is used
+to reduce link load, but the final bitrate remains controlled by camera
+firmware. Local `MT11_MAIN_STREAM_WIDTH` and `MT11_MAIN_STREAM_FPS` settings only
+affect preview processing and do not change network bandwidth.
+
 ## Local Stream Simulator
 
 MT11Control has a hidden local simulator for development without cameras. It only appears when this machine has:
